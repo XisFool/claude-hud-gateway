@@ -50,10 +50,10 @@ const stats = {
   heartbeatsSentTotal: 0,
 };
 
-// 心跳周期护栏：非法值（NaN/负数/过小）回退默认 8000ms，防止高频空转与心跳轰炸
+// 心跳周期护栏：非法值（NaN/负数/过小/过大）回退默认 8000ms，防止高频空转或击穿 Claude Code 30s 看门狗
 export function sanitizeHeartbeatIntervalMs(value, fallback = 8000) {
   const parsed = typeof value === 'number' ? value : Number.parseInt(value, 10);
-  return Number.isFinite(parsed) && parsed >= 200 ? parsed : fallback;
+  return Number.isFinite(parsed) && parsed >= 200 && parsed <= 25000 ? parsed : fallback;
 }
 
 // 1. 读取配置文件或环境变量
@@ -188,20 +188,47 @@ export function estimateTokens(payload, ratio = 2.5) {
   return Math.max(12, estimated + extraTokens);
 }
 
+function appendQueryParams(pathname, targetUrlObj, reqObj) {
+  const targetParams = targetUrlObj.searchParams;
+  const reqParams = reqObj.searchParams;
+
+  if ((!targetParams || targetParams.size === 0) && (!reqParams || reqParams.size === 0)) {
+    return pathname;
+  }
+
+  const mergedParams = new URLSearchParams(targetParams);
+  for (const [key, val] of reqParams.entries()) {
+    mergedParams.set(key, val);
+  }
+  const queryStr = mergedParams.toString();
+  return queryStr ? `${pathname}?${queryStr}` : pathname;
+}
+
 // 目标路径智能规范化（兼容裸主机、/v1 后缀与完整 /v1/messages 端点，规避 /v1/v1/messages 404 故障）
 export function resolveTargetPath(targetUrlObj, reqUrl) {
-  const basePath = targetUrlObj.pathname.replace(/\/+$/, '');
-  let reqPath = reqUrl;
-  // 按最长后缀优先匹配，带边界校验（后随 /、? 或结尾），防止误剥前缀
-  for (const suffix of ['/v1/messages', '/v1']) {
-    if (basePath === suffix || basePath.endsWith(suffix)) {
-      if (reqPath === suffix || reqPath.startsWith(`${suffix}/`) || reqPath.startsWith(`${suffix}?`)) {
-        reqPath = reqPath.slice(suffix.length);
-      }
-      break;
+  const normBase = targetUrlObj.pathname.replace(/\/+/g, '/').replace(/\/+$/, '');
+  const reqObj = new URL(reqUrl, 'http://127.0.0.1');
+  let reqPath = reqObj.pathname.replace(/\/+/g, '/');
+
+  if (normBase.endsWith('/v1/messages')) {
+    if (reqPath === '/v1/messages' || reqPath === '/messages') {
+      reqPath = '';
+    } else if (reqPath.startsWith('/v1/')) {
+      // 客户端请求非 messages 端点（如 /v1/models），剥离 Base URL 中的 /messages 后缀
+      const basePrefix = normBase.slice(0, -'/messages'.length);
+      const merged = (basePrefix + reqPath.slice(3)).replace(/\/+/g, '/');
+      return appendQueryParams(merged || '/', targetUrlObj, reqObj);
+    }
+  } else if (normBase.endsWith('/v1')) {
+    if (reqPath === '/v1') {
+      reqPath = '';
+    } else if (reqPath.startsWith('/v1/') || reqPath.startsWith('/v1?')) {
+      reqPath = reqPath.slice(3);
     }
   }
-  return (basePath + reqPath) || '/';
+
+  const mergedPath = ((normBase + reqPath).replace(/\/+/g, '/')) || '/';
+  return appendQueryParams(mergedPath, targetUrlObj, reqObj);
 }
 
 // SSE 事件块边界查找器（全面兼容 \r\n\r\n 与 \n\n 两种标准终止符）

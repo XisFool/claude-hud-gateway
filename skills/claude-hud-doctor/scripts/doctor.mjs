@@ -88,13 +88,27 @@ function createBackup(srcPath) {
   return bakPath;
 }
 
-// 未转义反斜杠扫描：逐字符配对 \\ 跳过后，仍出现孤立 \ 即为 Git Bash 吞噬风险。
-// 旧版 includes('\\') && !includes('\\\\') 会漏判"既有转义对又有孤立反斜杠"的混合命令
+// 未转义反斜杠扫描：
+// 1. Bash 单引号 '...' 内不发生反斜杠转义，内部反斜杠安全（字面量原样传递）；
+// 2. 成对反斜杠 \\ 属安全转义；
+// 3. Bash 合法转义字符（如转义空格 \ 、转义引号 \"）属合法转义；
+// 4. 其余孤立 \ 即为 Git Bash 吞噬风险（如 Windows 路径 C:\foo\bar）。
 function hasUnescapedBackslash(cmd) {
   const s = String(cmd || '');
+  let inSingleQuote = false;
+
   for (let i = 0; i < s.length; i++) {
-    if (s[i] === '\\') {
-      if (s[i + 1] === '\\') { i++; continue; }
+    const ch = s[i];
+    if (ch === "'") {
+      inSingleQuote = !inSingleQuote;
+      continue;
+    }
+    if (inSingleQuote) continue;
+
+    if (ch === '\\') {
+      const next = s[i + 1];
+      if (next === '\\') { i++; continue; }
+      if (next === ' ' || next === '"') { i++; continue; }
       return true;
     }
   }

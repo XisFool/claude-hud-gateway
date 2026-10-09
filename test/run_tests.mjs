@@ -248,6 +248,15 @@ it('resolveTargetPath: 兼容完整 /v1/messages 端点配置（含查询参数�
     resolveTargetPath(new URL('https://api.relay.com/v1'), '/v1messages'),
     '/v1/v1messages'
   );
+  // 非 messages 端点访问兼容（如 /v1/models）与 query 参数保留
+  assert.strictEqual(
+    resolveTargetPath(new URL('https://api.relay.com/v1/messages'), '/v1/models'),
+    '/v1/models'
+  );
+  assert.strictEqual(
+    resolveTargetPath(new URL('https://api.relay.com/v1?custom=1'), '/v1/messages'),
+    '/v1/messages?custom=1'
+  );
 });
 
 it('sanitizeHeartbeatIntervalMs: 非法心跳周期回退 8000ms，合法值原样保留', () => {
@@ -259,6 +268,9 @@ it('sanitizeHeartbeatIntervalMs: 非法心跳周期回退 8000ms，合法值原�
   assert.strictEqual(sanitizeHeartbeatIntervalMs(300), 300);
   assert.strictEqual(sanitizeHeartbeatIntervalMs('500'), 500);
   assert.strictEqual(sanitizeHeartbeatIntervalMs(8000), 8000);
+  assert.strictEqual(sanitizeHeartbeatIntervalMs(25000), 25000);
+  assert.strictEqual(sanitizeHeartbeatIntervalMs(30000), 8000, '超过 25000ms 的心跳周期必须回退默认值以防 30s 看门狗超时闪退');
+  assert.strictEqual(sanitizeHeartbeatIntervalMs(60000), 8000);
 });
 
 it('findSseBoundary: 能够精确识别 LF (\\n\\n) 与 CRLF (\\r\\n\\r\\n) 两种标准分隔符', () => {
@@ -483,6 +495,11 @@ async function runProxyTests() {
     const streamText = await res.text();
     assert(streamText.includes('event: message_start'), 'CRLF 模式下必须正确识别 message_start');
     assert(streamText.includes('crlf test'), 'CRLF 模式下必须正确输出正文 delta');
+    const startMatch = streamText.match(/data:\s*({.*"type":"message_start".*})/);
+    assert(startMatch, 'CRLF 流中必须包含可解析的 message_start');
+    const startPayload = JSON.parse(startMatch[1]);
+    const inputTokens = startPayload.message.usage.input_tokens;
+    assert(inputTokens > 0, `CRLF 模式下修补后的 input_tokens 必须大于 0，实际: ${inputTokens}`);
   });
 
   // 2.5 测试跨 TCP 分包的多字节 UTF-8 字符解码无乱码
@@ -1186,6 +1203,18 @@ async function runProxyTests() {
     const reportB = JSON.parse(outB);
     if (process.platform === 'win32') {
       assert.strictEqual(reportB.settings.issue, 'legacy_fragile_statusline', '通用 MSYS node 绝对路径必须被识别为脆弱配置');
+    }
+
+    // 场景 C：Bash 合法转义空格或单引号路径，不应误报反斜杠缺陷
+    fs.writeFileSync(
+      mockSettingsPath,
+      JSON.stringify({ statusLine: { type: 'command', command: 'node /c/Program\\ Files/statusline.mjs' } }),
+      'utf-8'
+    );
+    const { stdout: outC } = await execPromise(`node "${doctorScript}" --json`, { env: sandboxEnv });
+    const reportC = JSON.parse(outC);
+    if (process.platform === 'win32') {
+      assert.notStrictEqual(reportC.settings.issue, 'contains_unescaped_backslashes', 'Bash 转义空格不得误报反斜杠缺陷');
     }
 
     fs.rmSync(tmpDir, { recursive: true, force: true });

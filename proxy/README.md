@@ -65,7 +65,7 @@ cp proxy/config.example.json proxy/config.json
 
 > **注意**：如果 `targetApiKey` 留空，网关会自动透传 Claude Code 客户端传来的当前 API Key，无需重复配置！
 >
-> **TTFB 保护参数**：`ttfbGraceMs` 是“上游响应头迟迟不落地”时的提前应答宽限期（默认 10000ms，需小于 Claude Code 的 30s 看门狗）；`upstreamTimeoutMs` 是上游 TTFB 总超时（默认 60000ms），超时后非流式请求返回 504 JSON、流式请求下发 SSE error 事件。
+> **TTFB 保护与心跳参数**：`ttfbGraceMs` 是“上游响应头迟迟不落地”时的提前应答宽限期（默认 10000ms，需小于 Claude Code 的 30s 看门狗）；`heartbeatIntervalMs` 心跳周期（默认 8000ms，内置 200ms~25000ms 强护栏，防止配置过大反向击穿看门狗）；`upstreamTimeoutMs` 是上游 TTFB 总超时（默认 60000ms），超时后非流式请求返回 504 JSON、流式请求下发 SSE error 事件。
 
 也可以直接通过环境变量启动：
 ```bash

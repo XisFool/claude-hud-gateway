@@ -50,11 +50,11 @@ claude-hud-gateway/
 
 ### 3.2 TTFB 承诺与心跳保活机制 (P0-2 核心)
 - **TTFB 宽限承诺**：客户端发起流式请求后，启动 `ttfbGraceMs` 计时器（默认 10s）。若上游 10 秒未返回响应头，网关**主动向客户端提前发送 200 OK SSE 响应头并启动心跳**，使看门狗在响应头落地前即被覆盖。
-- **8 秒保活心跳**：静默期间每隔 `heartbeatIntervalMs`（默认 8s）推送 `event: ping\ndata: {"type":"ping"}\n\n`。收到上游数据块时立即重置空闲计时器。
+- **8 秒保活心跳与护栏**：静默期间每隔 `heartbeatIntervalMs`（默认 8s）推送 `event: ping\ndata: {"type":"ping"}\n\n`。收到上游数据块时立即重置空闲计时器。`sanitizeHeartbeatIntervalMs` 施加 `[200ms, 25000ms]` 强护栏，上限 25s 预留 5 秒余量，彻底杜绝配置过大反向击穿 30s 看门狗。
 - **黑洞超时保护**：上游超过 `upstreamTimeoutMs`（默认 60s）未回包时主动销毁连接，回写 504（非流式）或 `event: error`（已承诺 SSE 流），杜绝挂死。
 
 ### 3.3 路径智能去重
-- `resolveTargetPath` 必须兼容裸主机、`/v1` 后缀与完整 `/v1/messages` 端点配置，严禁出现 `/v1/v1/messages` 404 故障。
+- `resolveTargetPath` 必须兼容裸主机、`/v1` 后缀与完整 `/v1/messages` 端点配置，严禁出现 `/v1/v1/messages` 404 故障；同时支持非 messages 端点（如 `/v1/models`）智能互斥解析，并完整保留 Base URL 与请求所携带的 Query 查询参数。
 
 ### 3.4 探针安全防护 (P1-5 核心)
 - `probe_api.mjs` 遇到 301/302/307/308 重定向时，若目标 `origin` 与原地址不同，**必须强制剥离 `Authorization`、`x-api-key` 与 `anthropic-auth-token`**，严防恶意中转钓鱼窃取凭证。
@@ -65,7 +65,7 @@ claude-hud-gateway/
 
 ### 3.6 doctor CLI 降级链路安全 (P2 核心)
 - `doctor.mjs` 的 sqlite3 CLI 链路：读取必须优先 `-json` 精确模式（多行 JSON 不再被管道分隔解析误判损坏），写入必须走 `execFileSync` 免 Shell + SQL stdin 通道，严禁将配置内容拼入 shell 命令串（会被双引号剥离 / `$` 展开破坏）。
-- 反斜杠检测必须使用逐字符配对扫描（`hasUnescapedBackslash`），严禁 `includes('\\') && !includes('\\\\')` 式启发式（会漏判"既有转义对又有孤立反斜杠"的混合命令）。
+- 反斜杠检测必须使用状态机配对扫描（`hasUnescapedBackslash`），支持 Bash 单引号 `'...'` 转义抑制与合法转义字符白名单（`\ `、`\"`），杜绝误报合法语法，严禁 `includes('\\') && !includes('\\\\')` 式启发式（会漏判"既有转义对又有孤立反斜杠"的混合命令）。
 
 ---
 
