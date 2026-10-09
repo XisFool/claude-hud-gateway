@@ -716,16 +716,29 @@ async function runProxyTests() {
     assert.strictEqual(sameOriginCapturedHeaders['x-api-key'], 'keep-test-key', '同源重定向必须保留认证头');
   });
 
-  // 3.3 doctor.mjs --json 运行
-  it('doctor.mjs --json 运行无语法错误且输出有效结构', () => {
-    const output = execSync(
-      `node "${path.join(rootDir, 'skills', 'claude-hud-doctor', 'scripts', 'doctor.mjs')}" --json`,
-      { encoding: 'utf-8', env: { ...process.env, NODE_NO_WARNINGS: '1' } }
-    );
-    const parsed = JSON.parse(output);
-    assert.strictEqual(typeof parsed.platform, 'object');
-    assert.strictEqual(typeof parsed.settings, 'object');
-    assert.strictEqual(typeof parsed.gitBash, 'object');
+  // 3.3 doctor.mjs --json 运行（P2: 注入沙箱环境变量，与宿主机真实配置完全隔离）
+  it('doctor.mjs --json 运行无语法错误且输出有效结构（沙箱隔离）', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-hud-test-'));
+    try {
+      const output = execSync(
+        `node "${path.join(rootDir, 'skills', 'claude-hud-doctor', 'scripts', 'doctor.mjs')}" --json`,
+        {
+          encoding: 'utf-8',
+          env: {
+            ...process.env,
+            CLAUDE_CONFIG_DIR: path.join(tmpDir, '.claude'),
+            CC_SWITCH_DB_PATH: path.join(tmpDir, 'no-such.db'),
+            NODE_NO_WARNINGS: '1',
+          },
+        }
+      );
+      const parsed = JSON.parse(output);
+      assert.strictEqual(typeof parsed.platform, 'object');
+      assert.strictEqual(typeof parsed.settings, 'object');
+      assert.strictEqual(typeof parsed.gitBash, 'object');
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 
   // 3.4 doctor.mjs --fix 沙箱端到端自愈实测
@@ -952,10 +965,17 @@ async function runProxyTests() {
 
 runProxyTests()
   .then(() => {
+    // P2: 失败用例只在 it()/itAsync() 内置了过程级 exitCode，必须以判定结果显式收尾，
+    // 否则 process.exit(0) 会覆盖失败信号，导致 CI 流水线永远假绿
+    const allPassed = passedTests === totalTests && totalTests > 0;
     console.log(`\n${c.bold}======================================================${c.reset}`);
-    console.log(`${c.green}${c.bold}测试全部通过! (${passedTests}/${totalTests} Passed)${c.reset}`);
+    if (allPassed) {
+      console.log(`${c.green}${c.bold}测试全部通过! (${passedTests}/${totalTests} Passed)${c.reset}`);
+    } else {
+      console.log(`${c.red}${c.bold}测试存在失败! (${passedTests}/${totalTests} Passed)${c.reset}`);
+    }
     console.log(`${c.bold}======================================================${c.reset}\n`);
-    process.exit(0);
+    process.exit(allPassed ? 0 : 1);
   })
   .catch((err) => {
     console.error(`\n${c.red}测试套件异常崩溃:${c.reset}`, err);
