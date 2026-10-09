@@ -69,7 +69,7 @@ ${c.bold}Claude HUD API 流式探针 (probe_api)${c.reset}
   -b, --base-url <url>    中转 API 基础地址 (例如 https://api.openai.com 或 http://127.0.0.1:8080)
   -k, --api-key <key>     API 密钥 (Auth Token)
   -m, --model <name>      测试模型名称 (默认从配置读取，或 claude-3-7-sonnet)
-  -t, --timeout <ms>      请求超时时间 (默认 30000ms)
+  -t, --timeout <ms>      全局总超时 (默认 30000ms，覆盖 TTFB 与整个流式传输全程，防慢速滴包)
   --json                  输出机器可读的 JSON 格式
   -h, --help              显示帮助信息
 
@@ -124,6 +124,10 @@ if (targetUrlStr.endsWith('/v1/messages')) {
 } else {
   targetUrlStr = `${targetUrlStr}/v1/messages`;
 }
+
+// P2 全局硬性总超时：单次探针生命周期（含全部重定向跳转与流式接收）的绝对截止时间。
+// 仅靠 socket 空闲超时会被"慢速滴包"（间隔小于空闲阈值）无限绕过，必须叠加绝对时限。
+const probeDeadlineAt = Date.now() + timeoutMs;
 
 // SSE 事件块边界查找器（全面兼容 \r\n\r\n 与 \n\n 两种标准终止符）
 function findSseBoundary(buffer) {
@@ -208,9 +212,33 @@ async function runProbe(currentUrlStr = targetUrlStr, redirectHops = 0, stripAut
     headers['Authorization'] = `Bearer ${apiKey}`;
   }
 
+  // 重定向链路口径：若剩余预算已被前置跳转耗尽，直接熔断，不再发起新请求
+  if (probeDeadlineAt - Date.now() <= 0) {
+    probeReport.verdict = 'FAIL';
+    probeReport.verdictReason = `探针全局超时: 总耗时已超过 ${timeoutMs}ms（重定向跳转耗尽预算）`;
+    probeReport.recommendations.push('上游疑似通过多次慢速重定向拖延，已触发防慢滴全局熔断。');
+    return Promise.resolve();
+  }
+
   const startTime = Date.now();
 
   return new Promise((resolve) => {
+    let settled = false;
+    let handedOff = false; // 已转交重定向下一跳，本跳残余事件不再参与裁决
+    const settle = () => {
+      if (!settled) {
+        settled = true;
+        resolve();
+      }
+    };
+    const finishFail = (reason, recommendation) => {
+      if (settled || handedOff) return;
+      probeReport.verdict = 'FAIL';
+      probeReport.verdictReason = reason;
+      if (recommendation) probeReport.recommendations.push(recommendation);
+      settle();
+    };
+
     const req = transport.request(
       urlObj,
       {
@@ -228,6 +256,9 @@ async function runProbe(currentUrlStr = targetUrlStr, redirectHops = 0, stripAut
               ? `检测到跨域重定向至: ${redirectUrl}（安全策略：已剥离 x-api-key / Authorization 认证头，不予转发凭证）`
               : `检测到重定向至: ${redirectUrl}`
           );
+          handedOff = true;
+          clearDeadline();
+          res.resume(); // 排空重定向响应体，及时释放本跳连接资源
           return resolve(runProbe(redirectUrl, redirectHops + 1, stripAuth || isCrossOrigin));
         }
 
@@ -243,6 +274,7 @@ async function runProbe(currentUrlStr = targetUrlStr, redirectHops = 0, stripAut
         const decoder = new StringDecoder('utf-8');
 
         res.on('data', (chunk) => {
+          if (handedOff) return;
           rawBuffer += decoder.write(chunk);
 
           // 按标准 SSE 双换行解析事件（兼容 \r\n\r\n 与 \n\n）
@@ -257,36 +289,60 @@ async function runProbe(currentUrlStr = targetUrlStr, redirectHops = 0, stripAut
         });
 
         res.on('end', () => {
+          if (handedOff) return;
           rawBuffer += decoder.end();
           if (rawBuffer.trim()) {
             processSseEvent(rawBuffer.trim());
           }
           probeReport.http.totalDurationMs = Date.now() - startTime;
           finalizeVerdict();
-          resolve();
+          clearDeadline();
+          settle();
         });
 
         res.on('error', (err) => {
-          probeReport.verdict = 'FAIL';
-          probeReport.verdictReason = `流式传输中断: ${err.message}`;
-          resolve();
+          if (handedOff) return;
+          clearDeadline();
+          finishFail(`流式传输中断: ${err.message}`);
+        });
+
+        // 防御：连接被提前关闭且既无 end 也无 error 时兜底收尾，防止主流程永久挂起
+        res.on('close', () => {
+          if (handedOff) return;
+          if (!res.complete) {
+            clearDeadline();
+            finishFail('流式传输中断: 连接被提前关闭（响应不完整）', '上游/中间网关可能在流式传输中途断开连接。');
+          }
         });
       }
     );
 
+    // 全局硬性总超时计时器：专治"慢速滴包"以小于空闲阈值的间隔持续保活、绕过 socket 超时的场景
+    const hardDeadlineTimer = setTimeout(() => {
+      const deadlineErr = new Error(`全局总超时熔断 (${timeoutMs}ms)`);
+      deadlineErr.code = 'PROBE_DEADLINE';
+      req.destroy(deadlineErr);
+      finishFail(
+        `探针全局超时: 总耗时超过 ${timeoutMs}ms（上游疑似慢速滴包绕过空闲超时）`,
+        '已触发防慢滴全局熔断：上游持续微量滴包但迟迟不结束，请检查中转网关稳定性。'
+      );
+    }, Math.max(1, probeDeadlineAt - Date.now()));
+    hardDeadlineTimer.unref?.();
+    const clearDeadline = () => clearTimeout(hardDeadlineTimer);
+
     req.on('timeout', () => {
       req.destroy();
-      probeReport.verdict = 'FAIL';
-      probeReport.verdictReason = `请求超时 (超过 ${timeoutMs}ms 未完成)`;
-      probeReport.recommendations.push('上游服务响应过慢或卡顿，若使用推理思考模型，可能触发了 30s 崩溃机制。');
-      resolve();
+      clearDeadline();
+      finishFail(
+        `请求空闲超时 (超过 ${timeoutMs}ms 未完成)`,
+        '上游服务响应过慢或卡顿，若使用推理思考模型，可能触发了 30s 崩溃机制。'
+      );
     });
 
     req.on('error', (err) => {
-      probeReport.verdict = 'FAIL';
-      probeReport.verdictReason = `网络请求失败: ${err.message}`;
-      probeReport.recommendations.push('请检查目标 BASE_URL 是否可通，或网络防火墙设置。');
-      resolve();
+      if (handedOff) return;
+      clearDeadline();
+      finishFail(`网络请求失败: ${err.message}`, '请检查目标 BASE_URL 是否可通，或网络防火墙设置。');
     });
 
     req.write(payload);

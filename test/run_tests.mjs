@@ -802,6 +802,48 @@ async function runProxyTests() {
     assert.strictEqual(sameOriginCapturedHeaders['x-api-key'], 'keep-test-key', '同源重定向必须保留认证头');
   });
 
+  // 3.4b P2：探针全局总超时熔断——慢速滴包（间隔小于空闲阈值）无法再无限延长探针生命周期
+  await itAsync('probe_api.mjs 全局总超时熔断：慢速滴包绕过空闲超时也会被硬熔断 (P2)', async () => {
+    const DRIP_PORT = 19196;
+    const dripServer = http.createServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
+      // 每 250ms 滴一个 ping 持续 4 秒：间隔远小于 socket 空闲超时，专打旧实现的套接字超时漏洞
+      let pings = 0;
+      const timer = setInterval(() => {
+        if (res.writableEnded) return;
+        res.write('event: ping\ndata: {"type":"ping"}\n\n');
+        pings++;
+        if (pings >= 16) {
+          clearInterval(timer);
+          res.end();
+        }
+      }, 250);
+      res.on('close', () => clearInterval(timer));
+    });
+    await new Promise((resolve) => dripServer.listen(DRIP_PORT, '127.0.0.1', resolve));
+
+    try {
+      const probeScript = path.join(rootDir, 'skills', 'claude-hud-doctor', 'scripts', 'probe_api.mjs');
+      const start = Date.now();
+      const { stdout } = await execPromise(
+        `node "${probeScript}" --base-url "http://127.0.0.1:${DRIP_PORT}" --api-key "sk-drip" --timeout 800 --json`
+      );
+      const wallMs = Date.now() - start;
+      const report = JSON.parse(stdout);
+      assert.strictEqual(report.verdict, 'FAIL', '慢滴保活的流必须被裁决为 FAIL');
+      assert(
+        report.verdictReason.includes('全局超时'),
+        `裁决理由必须指出全局超时熔断，实际: ${report.verdictReason}`
+      );
+      assert(
+        wallMs < 3000,
+        `探针必须在全局时限附近结束（实际 ${wallMs}ms，旧实现会等慢滴自然结束接近 4000ms+）`
+      );
+    } finally {
+      await new Promise((resolve) => dripServer.close(resolve));
+    }
+  });
+
   // 3.3 doctor.mjs --json 运行（P2: 注入沙箱环境变量，与宿主机真实配置完全隔离）
   it('doctor.mjs --json 运行无语法错误且输出有效结构（沙箱隔离）', () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-hud-test-'));
