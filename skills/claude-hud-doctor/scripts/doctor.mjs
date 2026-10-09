@@ -56,7 +56,7 @@ ${c.bold}Claude HUD Doctor (环境诊断与一键自愈工具)${c.reset}
 const homeDir = os.homedir();
 const claudeDir = process.env.CLAUDE_CONFIG_DIR?.trim() || path.join(homeDir, '.claude');
 const settingsPath = path.join(claudeDir, 'settings.json');
-const ccSwitchDbPath = path.join(homeDir, '.cc-switch', 'cc-switch.db');
+const ccSwitchDbPath = process.env.CC_SWITCH_DB_PATH?.trim() || path.join(homeDir, '.cc-switch', 'cc-switch.db');
 const pluginsDir = path.join(claudeDir, 'plugins');
 const hudPluginDir = path.join(pluginsDir, 'claude-hud');
 const statuslineMjsPath = path.join(hudPluginDir, 'statusline.mjs');
@@ -195,6 +195,9 @@ if (fs.existsSync(settingsPath)) {
         } else if (cmd.includes('cols=$(stty') && !report.gitBash.present) {
           report.settings.issue = 'bash_syntax_without_git_bash';
           report.issuesFound.push('statusLine.command 包含 Bash 命令语法，但系统未检测到 Git for Windows，PowerShell 执行将报语法错误');
+        } else if (cmd.includes('cols=$(stty') || cmd.includes('/d/NodeJs/node') || cmd.includes('cmd.exe')) {
+          report.settings.issue = 'legacy_fragile_statusline';
+          report.issuesFound.push('settings.json 中的 statusLine.command 包含硬编码路径或脆弱的 Shell 脚本，建议一键升级为跨平台标准 statusline.mjs 入口');
         }
       }
     } else {
@@ -233,10 +236,15 @@ async function inspectCcSwitch() {
         try {
           const cfg = JSON.parse(p.settings_config || '{}');
           if (!cfg.statusLine || !cfg.statusLine.command) {
-            report.ccSwitch.missingStatusLineProviders.push({ id: p.id, name: p.name });
+            report.ccSwitch.missingStatusLineProviders.push({ id: p.id, name: p.name, reason: '缺失 statusLine 配置' });
+          } else {
+            const cmd = cfg.statusLine.command;
+            if ((cmd.includes('\\') && !cmd.includes('\\\\')) || cmd.includes('cmd.exe') || (cmd.includes('cols=$(stty') && !report.gitBash.present)) {
+              report.ccSwitch.missingStatusLineProviders.push({ id: p.id, name: p.name, reason: '包含不兼容的命令语法或未转义反斜杠' });
+            }
           }
         } catch {
-          report.ccSwitch.missingStatusLineProviders.push({ id: p.id, name: p.name });
+          report.ccSwitch.missingStatusLineProviders.push({ id: p.id, name: p.name, reason: '配置损坏无法解析' });
         }
       }
 
@@ -269,10 +277,15 @@ async function inspectCcSwitch() {
           try {
             const cfg = JSON.parse(jsonStr);
             if (!cfg.statusLine || !cfg.statusLine.command) {
-              report.ccSwitch.missingStatusLineProviders.push({ id, name });
+              report.ccSwitch.missingStatusLineProviders.push({ id, name, reason: '缺失 statusLine 配置' });
+            } else {
+              const cmd = cfg.statusLine.command;
+              if ((cmd.includes('\\') && !cmd.includes('\\\\')) || cmd.includes('cmd.exe') || (cmd.includes('cols=$(stty') && !report.gitBash.present)) {
+                report.ccSwitch.missingStatusLineProviders.push({ id, name, reason: '包含不兼容的命令语法或未转义反斜杠' });
+              }
             }
           } catch {
-            report.ccSwitch.missingStatusLineProviders.push({ id, name });
+            report.ccSwitch.missingStatusLineProviders.push({ id, name, reason: '配置损坏无法解析' });
           }
         }
       } catch {}
@@ -280,7 +293,7 @@ async function inspectCcSwitch() {
 
     if (report.ccSwitch.missingStatusLineProviders.length > 0) {
       report.issuesFound.push(
-        `cc-switch 中有 ${report.ccSwitch.missingStatusLineProviders.length} 个 Claude 供应商未配置 statusLine，切换至这些供应商会导致 HUD 立即丢失！`
+        `cc-switch 中有 ${report.ccSwitch.missingStatusLineProviders.length} 个 Claude 供应商存在 statusLine 缺失或兼容性隐患，切换至这些供应商会导致 HUD 失效！`
       );
     }
   } catch (err) {
@@ -456,9 +469,9 @@ async function main() {
     if (missing === 0) {
       console.log(`   状态: ${pass} 所有 Claude 供应商档案 (${report.ccSwitch.claudeProviders} 个) 均已固化 statusLine`);
     } else {
-      console.log(`   状态: ${fail} 检测到 ${missing} 个供应商缺失 statusLine (切换后会冲掉 HUD!):`);
+      console.log(`   状态: ${fail} 检测到 ${missing} 个供应商存在 statusLine 缺失或隐患 (切换后会导致 HUD 失效!):`);
       for (const p of report.ccSwitch.missingStatusLineProviders) {
-        console.log(`     - [${p.id}] ${p.name}`);
+        console.log(`     - [${p.id}] ${p.name}${p.reason ? ` (${c.yellow}${p.reason}${c.reset})` : ''}`);
       }
     }
   }

@@ -21,6 +21,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { StringDecoder } from 'node:string_decoder';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -88,6 +89,7 @@ function loadConfig() {
   const targetApiKey = process.env.TARGET_API_KEY || fileConfig.targetApiKey || '';
   const heartbeatIntervalMs = Number.parseInt(process.env.HEARTBEAT_INTERVAL_MS || fileConfig.heartbeatIntervalMs || '8000', 10);
   const autoEstimateTokens = process.env.AUTO_ESTIMATE_TOKENS !== 'false' && (fileConfig.autoEstimateTokens !== false);
+  const tokenEstimateRatio = Number.parseFloat(process.env.TOKEN_ESTIMATE_RATIO || fileConfig.tokenEstimateRatio || '2.5');
 
   return {
     port,
@@ -96,13 +98,14 @@ function loadConfig() {
     targetApiKey,
     heartbeatIntervalMs,
     autoEstimateTokens,
+    tokenEstimateRatio: Number.isNaN(tokenEstimateRatio) ? 2.5 : tokenEstimateRatio,
   };
 }
 
 const config = loadConfig();
 
 // 2. 启发式 Prompt Token 估算算法（多语言与代码自适应）
-export function estimateTokens(payload) {
+export function estimateTokens(payload, ratio = 2.5) {
   if (!payload) return 50;
   let text = '';
 
@@ -123,9 +126,22 @@ export function estimateTokens(payload) {
         text += msg.content;
       } else if (Array.isArray(msg.content)) {
         for (const block of msg.content) {
-          if (block?.text) text += block.text;
-          else if (block?.type === 'tool_result' && typeof block.content === 'string') text += block.content;
-          else if (block?.type === 'tool_use') text += JSON.stringify(block.input || {});
+          if (block?.text) {
+            text += block.text;
+          } else if (block?.type === 'tool_result') {
+            if (typeof block.content === 'string') {
+              text += block.content;
+            } else if (Array.isArray(block.content)) {
+              for (const sub of block.content) {
+                if (sub?.text) text += sub.text;
+                else if (typeof sub === 'string') text += sub;
+              }
+            } else if (block.content) {
+              text += JSON.stringify(block.content);
+            }
+          } else if (block?.type === 'tool_use') {
+            text += JSON.stringify(block.input || {});
+          }
         }
       }
     }
@@ -149,9 +165,33 @@ export function estimateTokens(payload) {
     }
   }
 
-  // 经验分词系数：中文约 1.5 tokens/字，英文/符号约 0.28 tokens/字 (3.5 字符/Token)
-  const estimated = Math.ceil((cjkCount * 1.5) + (otherCount / 3.5));
+  // 经验分词系数：依据 ratio 参数做自适应调整
+  const charDivisor = Math.max(1, ratio);
+  const estimated = Math.ceil((cjkCount * 1.5) + (otherCount / charDivisor));
   return Math.max(12, estimated);
+}
+
+// 目标路径智能规范化（规避 /v1 拼接导致的 /v1/v1/messages 404 故障）
+export function resolveTargetPath(targetUrlObj, reqUrl) {
+  const basePath = targetUrlObj.pathname.replace(/\/+$/, '');
+  let reqPath = reqUrl;
+  if (basePath.endsWith('/v1') && (reqPath === '/v1' || reqPath.startsWith('/v1/'))) {
+    reqPath = reqPath.slice(3);
+  }
+  return (basePath + reqPath) || '/';
+}
+
+// SSE 事件块边界查找器（全面兼容 \r\n\r\n 与 \n\n 两种标准终止符）
+export function findSseBoundary(buffer) {
+  const crlf = buffer.indexOf('\r\n\r\n');
+  const lf = buffer.indexOf('\n\n');
+  if (crlf !== -1 && (lf === -1 || crlf < lf)) {
+    return { index: crlf, length: 4 };
+  }
+  if (lf !== -1) {
+    return { index: lf, length: 2 };
+  }
+  return null;
 }
 
 // 3. 构建 HTTP 代理服务器
@@ -201,11 +241,11 @@ export function createProxyServer(customConfig = {}) {
 
       // 计算本轮预估 Token
       const promptTokenEstimate = (isMessagesEndpoint && mergedConfig.autoEstimateTokens)
-        ? estimateTokens(parsedPayload)
+        ? estimateTokens(parsedPayload, mergedConfig.tokenEstimateRatio)
         : 100;
 
       // 准备转发请求的目标 URL 与 Headers
-      const targetPath = `${targetUrlObj.pathname.replace(/\/+$/, '')}${req.url}`;
+      const targetPath = resolveTargetPath(targetUrlObj, req.url);
       const forwardHeaders = { ...req.headers };
 
       forwardHeaders.host = targetUrlObj.host;
@@ -214,8 +254,18 @@ export function createProxyServer(customConfig = {}) {
         forwardHeaders['anthropic-auth-token'] = mergedConfig.targetApiKey;
         forwardHeaders['authorization'] = `Bearer ${mergedConfig.targetApiKey}`;
       }
+
+      // 禁用上游 gzip/br 压缩以确保代理能稳定透明解析 SSE 文本与 JSON
+      delete forwardHeaders['accept-encoding'];
+      forwardHeaders['accept-encoding'] = 'identity';
+
       delete forwardHeaders['content-length'];
-      forwardHeaders['content-length'] = Buffer.byteLength(rawBody);
+      if (rawBody.length > 0) {
+        forwardHeaders['content-length'] = Buffer.byteLength(rawBody);
+      }
+
+      let clientClosed = false;
+      let streamClosed = false;
 
       // 创建向上游的请求
       const upstreamReq = transport.request(
@@ -232,8 +282,8 @@ export function createProxyServer(customConfig = {}) {
           const status = upstreamRes.statusCode;
           const isUpstreamSse = (upstreamRes.headers['content-type'] || '').includes('text/event-stream');
 
-          // 【场景 A】：流式请求（stream=true 且上游返回 SSE）
-          if (isStreaming && isUpstreamSse) {
+          // 【场景 A】：流式请求（stream=true 且上游返回成功 SSE）
+          if (isStreaming && isUpstreamSse && status === 200) {
             stats.activeStreams++;
             console.log(`${c.blue}[REQ #${requestId}]${c.reset} ${req.method} ${req.url} -> SSE 流开启 (TTFB: ${ttfbMs}ms, 预估 Token: ${promptTokenEstimate})`);
 
@@ -253,27 +303,40 @@ export function createProxyServer(customConfig = {}) {
             let lastChunkTime = Date.now();
             let sseBuffer = '';
             let messageStartSeen = false;
+            const decoder = new StringDecoder('utf-8');
+
+            const cleanupStream = () => {
+              if (streamClosed) return;
+              streamClosed = true;
+              clearInterval(heartbeatTimer);
+              stats.activeStreams = Math.max(0, stats.activeStreams - 1);
+            };
 
             // 【功能 2：30s 看门狗保活心跳定时器】
+            const checkInterval = Math.min(1000, Math.max(200, Math.floor(mergedConfig.heartbeatIntervalMs / 2)));
             const heartbeatTimer = setInterval(() => {
+              if (clientClosed || res.writableEnded) {
+                cleanupStream();
+                return;
+              }
               const idleMs = Date.now() - lastChunkTime;
-              if (idleMs >= mergedConfig.heartbeatIntervalMs - 200) {
+              if (idleMs >= mergedConfig.heartbeatIntervalMs) {
                 res.write('event: ping\ndata: {"type":"ping"}\n\n');
                 lastChunkTime = Date.now();
                 stats.heartbeatsSentTotal++;
                 console.log(`${c.magenta}[HEARTBEAT #${requestId}]${c.reset} 模型长思考中，已下发保活心跳 event: ping (防 30s 崩溃)`);
               }
-            }, mergedConfig.heartbeatIntervalMs);
+            }, checkInterval);
 
             upstreamRes.on('data', (chunk) => {
               lastChunkTime = Date.now();
-              sseBuffer += chunk.toString('utf-8');
+              sseBuffer += decoder.write(chunk);
 
-              // 分割出完整 SSE 事件块
+              // 分割出完整 SSE 事件块（支持 \r\n\r\n 与 \n\n 边界）
               let boundary;
-              while ((boundary = sseBuffer.indexOf('\n\n')) !== -1) {
-                const eventBlock = sseBuffer.slice(0, boundary);
-                sseBuffer = sseBuffer.slice(boundary + 2);
+              while ((boundary = findSseBoundary(sseBuffer)) !== null) {
+                const eventBlock = sseBuffer.slice(0, boundary.index);
+                sseBuffer = sseBuffer.slice(boundary.index + boundary.length);
 
                 if (!eventBlock.trim()) continue;
 
@@ -290,8 +353,8 @@ export function createProxyServer(customConfig = {}) {
             });
 
             upstreamRes.on('end', () => {
-              clearInterval(heartbeatTimer);
-              stats.activeStreams--;
+              cleanupStream();
+              sseBuffer += decoder.end();
 
               if (sseBuffer.trim()) {
                 const finalBlock = processSseEventBlock(
@@ -303,31 +366,25 @@ export function createProxyServer(customConfig = {}) {
                 res.write(finalBlock + '\n\n');
               }
 
-              res.end();
+              if (!res.writableEnded) {
+                res.end();
+              }
               const totalMs = Date.now() - startTime;
               console.log(`${c.green}[DONE #${requestId}]${c.reset} 流传输完成 (总耗时: ${totalMs}ms)`);
             });
 
             upstreamRes.on('error', (err) => {
-              clearInterval(heartbeatTimer);
-              stats.activeStreams--;
+              cleanupStream();
               console.error(`${c.red}[ERR #${requestId}]${c.reset} 上游流中断: ${err.message}`);
-              res.end();
-            });
-
-            // 客户端如果主动掐断连接，立刻销毁上游请求以节省 Token
-            req.on('close', () => {
-              clearInterval(heartbeatTimer);
-              if (!upstreamRes.complete) {
-                upstreamReq.destroy();
-                stats.activeStreams = Math.max(0, stats.activeStreams - 1);
+              if (!res.writableEnded) {
+                res.end();
               }
             });
 
             return;
           }
 
-          // 【场景 B】：非流式请求
+          // 【场景 B】：非流式请求 或 错误响应
           const chunks = [];
           upstreamRes.on('data', (c) => chunks.push(c));
           upstreamRes.on('end', () => {
@@ -352,7 +409,9 @@ export function createProxyServer(customConfig = {}) {
             const resHeaders = { ...upstreamRes.headers };
             delete resHeaders['transfer-encoding'];
             resHeaders['content-length'] = Buffer.byteLength(finalBuffer);
-            res.writeHead(status, resHeaders);
+            if (!res.headersSent) {
+              res.writeHead(status, resHeaders);
+            }
             res.end(finalBuffer);
 
             const totalMs = Date.now() - startTime;
@@ -363,13 +422,25 @@ export function createProxyServer(customConfig = {}) {
 
       upstreamReq.on('error', (err) => {
         console.error(`${c.red}[ERROR #${requestId}]${c.reset} 转发到上游失败: ${err.message}`);
-        res.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({
-          error: {
-            type: 'gateway_error',
-            message: `claude-hud-gateway 无法连接到目标上游 (${mergedConfig.targetBaseUrl}): ${err.message}`,
-          },
-        }));
+        if (!res.headersSent) {
+          res.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({
+            error: {
+              type: 'gateway_error',
+              message: `claude-hud-gateway 无法连接到目标上游 (${mergedConfig.targetBaseUrl}): ${err.message}`,
+            },
+          }));
+        } else {
+          res.destroy();
+        }
+      });
+
+      // 客户端如果提前掐断连接（非正常完成），立刻销毁上游请求以节省 Token 与连接
+      res.on('close', () => {
+        clientClosed = true;
+        if (!res.writableEnded && !upstreamReq.destroyed) {
+          upstreamReq.destroy();
+        }
       });
 
       // 写入请求体并发送
@@ -380,6 +451,8 @@ export function createProxyServer(customConfig = {}) {
     });
   });
 
+  server.stats = stats;
+  server.config = mergedConfig;
   return server;
 }
 
@@ -407,7 +480,17 @@ function processSseEventBlock(rawBlock, estimatedTokens, requestId, onMessageSta
   // 1. 拦截 message_start
   if (eventName === 'message_start' || parsedData?.type === 'message_start') {
     onMessageStart?.();
-    const msg = parsedData.message || parsedData;
+    if (!parsedData.message) {
+      parsedData.message = {
+        id: parsedData.id || `msg_gen_${Date.now()}`,
+        type: 'message',
+        role: 'assistant',
+        model: parsedData.model || 'unknown',
+        content: [],
+        usage: {},
+      };
+    }
+    const msg = parsedData.message;
     msg.usage = msg.usage || {};
 
     const currentInput = msg.usage.input_tokens;
@@ -423,12 +506,11 @@ function processSseEventBlock(rawBlock, estimatedTokens, requestId, onMessageSta
 
   // 2. 拦截 message_delta (双保救赎)
   if (eventName === 'message_delta' || parsedData?.type === 'message_delta') {
-    if (parsedData.usage) {
-      const currentInput = parsedData.usage.input_tokens;
-      if (typeof currentInput !== 'number' || currentInput <= 0) {
-        parsedData.usage.input_tokens = estimatedTokens;
-        return `event: message_delta\ndata: ${JSON.stringify(parsedData)}`;
-      }
+    parsedData.usage = parsedData.usage || {};
+    const currentInput = parsedData.usage.input_tokens;
+    if (typeof currentInput !== 'number' || currentInput <= 0) {
+      parsedData.usage.input_tokens = estimatedTokens;
+      return `event: message_delta\ndata: ${JSON.stringify(parsedData)}`;
     }
   }
 

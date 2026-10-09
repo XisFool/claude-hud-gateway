@@ -10,11 +10,11 @@
     "claude-hud-proxy": "./proxy/proxy.mjs"
   },
   "scripts": {
-    "doctor": "node skills/claude-hud-doctor/scripts/doctor.mjs",
-    "doctor:fix": "node skills/claude-hud-doctor/scripts/doctor.mjs --fix",
+    "doctor": "node --no-warnings skills/claude-hud-doctor/scripts/doctor.mjs",
+    "doctor:fix": "node --no-warnings skills/claude-hud-doctor/scripts/doctor.mjs --fix",
     "probe": "node skills/claude-hud-doctor/scripts/probe_api.mjs",
     "proxy": "node proxy/proxy.mjs",
-    "test": "node test/run_tests.mjs"
+    "test": "node --no-warnings test/run_tests.mjs"
   },
   "keywords": [
     "claude-code",

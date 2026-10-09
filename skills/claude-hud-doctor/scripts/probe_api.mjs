@@ -19,6 +19,7 @@ import path from 'node:path';
 import http from 'node:http';
 import https from 'node:https';
 import { URL } from 'node:url';
+import { StringDecoder } from 'node:string_decoder';
 
 // ANSI 颜色辅助
 const c = {
@@ -114,10 +115,27 @@ if (!baseUrl) {
   process.exit(1);
 }
 
-// 规范化 URL
+// 规范化 URL（智能处理 /v1 避免重复拼接为 /v1/v1/messages）
 let targetUrlStr = baseUrl.replace(/\/+$/, '');
-if (!targetUrlStr.endsWith('/v1/messages')) {
+if (targetUrlStr.endsWith('/v1/messages')) {
+  // 已经是完整端点
+} else if (targetUrlStr.endsWith('/v1')) {
+  targetUrlStr = `${targetUrlStr}/messages`;
+} else {
   targetUrlStr = `${targetUrlStr}/v1/messages`;
+}
+
+// SSE 事件块边界查找器（全面兼容 \r\n\r\n 与 \n\n 两种标准终止符）
+function findSseBoundary(buffer) {
+  const crlf = buffer.indexOf('\r\n\r\n');
+  const lf = buffer.indexOf('\n\n');
+  if (crlf !== -1 && (lf === -1 || crlf < lf)) {
+    return { index: crlf, length: 4 };
+  }
+  if (lf !== -1) {
+    return { index: lf, length: 2 };
+  }
+  return null;
 }
 
 // 探针结果记录
@@ -154,9 +172,15 @@ const probeReport = {
   recommendations: [],
 };
 
-// 发送探针请求
-async function runProbe() {
-  const urlObj = new URL(targetUrlStr);
+// 发送探针请求 (支持重定向与透明解码)
+async function runProbe(currentUrlStr = targetUrlStr, redirectHops = 0) {
+  if (redirectHops > 3) {
+    probeReport.verdict = 'FAIL';
+    probeReport.verdictReason = 'HTTP 重定向次数过多 (超过 3 次)';
+    return;
+  }
+
+  const urlObj = new URL(currentUrlStr);
   const isHttps = urlObj.protocol === 'https:';
   const transport = isHttps ? https : http;
 
@@ -173,6 +197,7 @@ async function runProbe() {
     'Content-Type': 'application/json',
     'anthropic-version': '2023-06-01',
     'User-Agent': 'claude-hud-gateway-probe/1.0.0',
+    'Accept-Encoding': 'identity',
     'Content-Length': Buffer.byteLength(payload),
   };
 
@@ -193,6 +218,13 @@ async function runProbe() {
         timeout: timeoutMs,
       },
       (res) => {
+        // 处理 HTTP 重定向
+        if ([301, 302, 307, 308].includes(res.statusCode) && res.headers.location) {
+          const redirectUrl = new URL(res.headers.location, urlObj).toString();
+          probeReport.recommendations.push(`检测到服务端重定向至: ${redirectUrl}`);
+          return resolve(runProbe(redirectUrl, redirectHops + 1));
+        }
+
         probeReport.http.ttfbMs = Date.now() - startTime;
         probeReport.http.status = res.statusCode;
         probeReport.http.statusText = res.statusMessage;
@@ -202,15 +234,16 @@ async function runProbe() {
         probeReport.sse.isStream = contentType.includes('text/event-stream');
 
         let rawBuffer = '';
+        const decoder = new StringDecoder('utf-8');
 
         res.on('data', (chunk) => {
-          rawBuffer += chunk.toString('utf-8');
+          rawBuffer += decoder.write(chunk);
 
-          // 按连续双换行解析 SSE 事件
-          let boundaryIndex;
-          while ((boundaryIndex = rawBuffer.indexOf('\n\n')) !== -1) {
-            const rawEvent = rawBuffer.slice(0, boundaryIndex).trim();
-            rawBuffer = rawBuffer.slice(boundaryIndex + 2);
+          // 按标准 SSE 双换行解析事件（兼容 \r\n\r\n 与 \n\n）
+          let boundary;
+          while ((boundary = findSseBoundary(rawBuffer)) !== null) {
+            const rawEvent = rawBuffer.slice(0, boundary.index).trim();
+            rawBuffer = rawBuffer.slice(boundary.index + boundary.length);
 
             if (!rawEvent) continue;
             processSseEvent(rawEvent);
@@ -218,6 +251,7 @@ async function runProbe() {
         });
 
         res.on('end', () => {
+          rawBuffer += decoder.end();
           if (rawBuffer.trim()) {
             processSseEvent(rawBuffer.trim());
           }
