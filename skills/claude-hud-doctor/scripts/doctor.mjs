@@ -12,7 +12,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execSync } from 'node:child_process';
+import { execSync, execFileSync } from 'node:child_process';
 
 // ANSI 颜色辅助
 const c = {
@@ -86,6 +86,59 @@ function createBackup(srcPath) {
   }
   fs.copyFileSync(srcPath, bakPath);
   return bakPath;
+}
+
+// 未转义反斜杠扫描：逐字符配对 \\ 跳过后，仍出现孤立 \ 即为 Git Bash 吞噬风险。
+// 旧版 includes('\\') && !includes('\\\\') 会漏判"既有转义对又有孤立反斜杠"的混合命令
+function hasUnescapedBackslash(cmd) {
+  const s = String(cmd || '');
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] === '\\') {
+      if (s[i + 1] === '\\') { i++; continue; }
+      return true;
+    }
+  }
+  return false;
+}
+
+// 加载 node:sqlite 内置驱动（Node >= 22.5）；CC_SWITCH_FORCE_CLI=1 强制走 sqlite3 CLI 降级链路（测试专用）
+async function loadNodeSqlite() {
+  if (process.env.CC_SWITCH_FORCE_CLI === '1') return null;
+  try {
+    const sqlite = await import('node:sqlite');
+    return sqlite.DatabaseSync || null;
+  } catch {
+    return null;
+  }
+}
+
+// sqlite3 CLI 读取 Claude 供应商：优先 -json 模式，正确处理含换行/引号的多行 JSON；
+// 旧版 CLI 不支持 -json 时报错回退，再以管道分隔解析（仅适用于单行 JSON）
+function readClaudeProvidersViaCli(dbPath) {
+  const sql = "SELECT id, name, settings_config FROM providers WHERE app_type='claude';";
+  const opts = { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'ignore'] };
+  let raw = '';
+  try {
+    raw = execFileSync('sqlite3', ['-json', dbPath, sql], opts);
+  } catch {
+    raw = execFileSync('sqlite3', [dbPath, sql], opts);
+    return raw.trim().split(/\r?\n/).filter(Boolean).map((line) => {
+      const parts = line.split('|');
+      return { id: parts[0], name: parts[1], settings_config: parts.slice(2).join('|') };
+    });
+  }
+  const trimmed = raw.trim();
+  if (!trimmed) return [];
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return [];
+  }
+}
+
+// sqlite3 CLI 写入：免 Shell 的 execFileSync + SQL 经 stdin 通道，彻底绕开引号/反斜杠/$ 转义破坏
+function execSqliteViaStdin(dbPath, sql) {
+  execFileSync('sqlite3', [dbPath], { input: sql, encoding: 'utf-8' });
 }
 
 // 标准 statusline.mjs 脚本内容模板（若本地缺失可直接重建）
@@ -207,13 +260,13 @@ if (fs.existsSync(settingsPath)) {
       if (process.platform === 'win32') {
         const cmd = parsed.statusLine.command || '';
         // 检查是否使用了会导致 Git Bash 吞掉的反斜杠
-        if (cmd.includes('\\') && !cmd.includes('\\\\')) {
+        if (hasUnescapedBackslash(cmd)) {
           report.settings.issue = 'contains_unescaped_backslashes';
           report.issuesFound.push('settings.json 中的 statusLine.command 包含未转义反斜杠，在 Git Bash 中会导致路径解析破坏');
         } else if (cmd.includes('cols=$(stty') && !report.gitBash.present) {
           report.settings.issue = 'bash_syntax_without_git_bash';
           report.issuesFound.push('statusLine.command 包含 Bash 命令语法，但系统未检测到 Git for Windows，PowerShell 执行将报语法错误');
-        } else if (cmd.includes('cols=$(stty') || cmd.includes('/d/NodeJs/node') || cmd.includes('cmd.exe')) {
+        } else if (cmd.includes('cols=$(stty') || cmd.includes('cmd.exe') || /\/[a-z]\/(?:[^"'\s]+\/)*node(?:\.exe)?\b/i.test(cmd)) {
           report.settings.issue = 'legacy_fragile_statusline';
           report.issuesFound.push('settings.json 中的 statusLine.command 包含硬编码路径或脆弱的 Shell 脚本，建议一键升级为跨平台标准 statusline.mjs 入口');
         }
@@ -237,11 +290,7 @@ async function inspectCcSwitch() {
   report.ccSwitch.installed = true;
 
   try {
-    let DatabaseSync;
-    try {
-      const sqlite = await import('node:sqlite');
-      DatabaseSync = sqlite.DatabaseSync;
-    } catch {}
+    const DatabaseSync = await loadNodeSqlite();
 
     if (DatabaseSync) {
       const db = new DatabaseSync(ccSwitchDbPath);
@@ -257,7 +306,7 @@ async function inspectCcSwitch() {
             report.ccSwitch.missingStatusLineProviders.push({ id: p.id, name: p.name, reason: '缺失 statusLine 配置' });
           } else {
             const cmd = cfg.statusLine.command;
-            if ((cmd.includes('\\') && !cmd.includes('\\\\')) || cmd.includes('cmd.exe') || (cmd.includes('cols=$(stty') && !report.gitBash.present)) {
+            if (hasUnescapedBackslash(cmd) || cmd.includes('cmd.exe') || (cmd.includes('cols=$(stty') && !report.gitBash.present)) {
               report.ccSwitch.missingStatusLineProviders.push({ id: p.id, name: p.name, reason: '包含不兼容的命令语法或未转义反斜杠' });
             }
           }
@@ -279,26 +328,19 @@ async function inspectCcSwitch() {
 
       db.close();
     } else {
-      // 降级尝试 sqlite3 CLI
+      // 降级尝试 sqlite3 CLI（-json 精确读取，杜绝多行 JSON 被管道解析误判损坏）
       try {
-        const rowsRaw = execSync(`sqlite3 "${ccSwitchDbPath}" "SELECT id, name, settings_config FROM providers WHERE app_type='claude';"`, {
-          encoding: 'utf-8',
-          stdio: ['pipe', 'pipe', 'ignore'],
-        });
-        const lines = rowsRaw.trim().split(/\r?\n/).filter(Boolean);
-        report.ccSwitch.claudeProviders = lines.length;
-        for (const line of lines) {
-          const parts = line.split('|');
-          const id = parts[0];
-          const name = parts[1];
-          const jsonStr = parts.slice(2).join('|');
+        const providers = readClaudeProvidersViaCli(ccSwitchDbPath);
+        report.ccSwitch.claudeProviders = providers.length;
+        for (const p of providers) {
+          const { id, name } = p;
           try {
-            const cfg = JSON.parse(jsonStr);
+            const cfg = JSON.parse(p.settings_config || '{}');
             if (!cfg.statusLine || !cfg.statusLine.command) {
               report.ccSwitch.missingStatusLineProviders.push({ id, name, reason: '缺失 statusLine 配置' });
             } else {
               const cmd = cfg.statusLine.command;
-              if ((cmd.includes('\\') && !cmd.includes('\\\\')) || cmd.includes('cmd.exe') || (cmd.includes('cols=$(stty') && !report.gitBash.present)) {
+              if (hasUnescapedBackslash(cmd) || cmd.includes('cmd.exe') || (cmd.includes('cols=$(stty') && !report.gitBash.present)) {
                 report.ccSwitch.missingStatusLineProviders.push({ id, name, reason: '包含不兼容的命令语法或未转义反斜杠' });
               }
             }
@@ -383,11 +425,7 @@ async function applyFixes() {
         const dbBakPath = createBackup(ccSwitchDbPath);
         report.fixesApplied.push(`已备份原始 cc-switch.db -> ${dbBakPath}`);
 
-        let DatabaseSync;
-        try {
-          const sqlite = await import('node:sqlite');
-          DatabaseSync = sqlite.DatabaseSync;
-        } catch {}
+        const DatabaseSync = await loadNodeSqlite();
 
         if (DatabaseSync) {
           const db = new DatabaseSync(ccSwitchDbPath);
@@ -429,25 +467,27 @@ async function applyFixes() {
           report.fixesApplied.push(`已在 cc-switch.db 中固化 ${updatedCount} 个问题供应商档案及全局配置的 statusLine（健康档案保持不变）`);
           report.ccSwitch.missingStatusLineProviders = unableToFix;
         } else {
-          // 降级使用 sqlite3 CLI（同样仅修复问题档案）
+          // 降级使用 sqlite3 CLI（-json 精确读取 + stdin 安全写入，同样仅修复问题档案）
           try {
-            const rowsRaw = execSync(`sqlite3 "${ccSwitchDbPath}" "SELECT id, settings_config FROM providers WHERE app_type='claude';"`, {
-              encoding: 'utf-8',
-            });
-            const lines = rowsRaw.trim().split(/\r?\n/).filter(Boolean);
-            for (const line of lines) {
-              const [id, ...rest] = line.split('|');
-              if (!problemIds.has(id)) continue;
-              const cfgJson = rest.join('|');
+            const providers = readClaudeProvidersViaCli(ccSwitchDbPath);
+            let updatedCount = 0;
+            const unableToFix = [];
+            for (const p of providers) {
+              if (!problemIds.has(p.id)) continue;
               try {
-                const cfg = JSON.parse(cfgJson);
+                const cfg = JSON.parse(p.settings_config || '{}');
                 cfg.statusLine = standardStatusLine;
-                const escaped = JSON.stringify(cfg).replace(/'/g, "''");
-                execSync(`sqlite3 "${ccSwitchDbPath}" "UPDATE providers SET settings_config='${escaped}' WHERE id='${id}';"`);
-              } catch {}
+                // 仅需转义 SQL 单引号；SQL 经 stdin 通道传输，不再受 Shell 双引号/反斜杠/$ 转义破坏
+                const escapedJson = JSON.stringify(cfg).replace(/'/g, "''");
+                const escapedId = String(p.id).replace(/'/g, "''");
+                execSqliteViaStdin(ccSwitchDbPath, `UPDATE providers SET settings_config='${escapedJson}' WHERE id='${escapedId}';`);
+                updatedCount++;
+              } catch {
+                unableToFix.push({ id: p.id, name: p.name, reason: '配置损坏无法解析，未修复' });
+              }
             }
-            report.fixesApplied.push(`通过 sqlite3 CLI 修复了 cc-switch 问题供应商档案中的 statusLine`);
-            report.ccSwitch.missingStatusLineProviders = [];
+            report.fixesApplied.push(`通过 sqlite3 CLI stdin 安全通道修复了 ${updatedCount} 个 cc-switch 问题供应商档案的 statusLine`);
+            report.ccSwitch.missingStatusLineProviders = unableToFix;
           } catch (cliErr) {
             report.fixesApplied.push(`cc-switch 自动修复降级失败: ${cliErr.message}`);
           }

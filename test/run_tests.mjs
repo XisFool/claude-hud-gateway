@@ -1042,6 +1042,113 @@ async function runProxyTests() {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
+  // 3.8 P2：sqlite3 CLI 降级链路（FORCE_CLI 强制）-json 精确读取 + stdin 安全写入
+  await itAsync('doctor.mjs 在 sqlite3 CLI 降级链路下精确诊断并安全修复含引号/换行的多行 JSON', async () => {
+    let hasCli = false;
+    try {
+      execSync('sqlite3 -version', { stdio: 'ignore' });
+      hasCli = true;
+    } catch {}
+    let sqliteModule;
+    try {
+      sqliteModule = await import('node:sqlite');
+    } catch {}
+    if (!hasCli || !sqliteModule?.DatabaseSync) return; // 无 sqlite3 CLI 或无 node:sqlite 的环境跳过
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-hud-test-'));
+    const mockClaudeDir = path.join(tmpDir, '.claude');
+    fs.mkdirSync(mockClaudeDir, { recursive: true });
+    const dbPath = path.join(tmpDir, 'mock-cc-switch.db');
+
+    // 构造 pretty-print 多行 JSON 且含 ' " $ 与真实换行的供应商，专门打击管道分隔解析与 Shell 引号转义
+    const trickyNote = `it's "quoted" $HOME\nsecond line`;
+    const trickySettingsConfig = JSON.stringify({ env: { NOTE: trickyNote } }, null, 2);
+    {
+      const db = new sqliteModule.DatabaseSync(dbPath);
+      db.exec(`
+        CREATE TABLE providers (id TEXT PRIMARY KEY, name TEXT, app_type TEXT, settings_config TEXT);
+        CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);
+      `);
+      db.prepare('INSERT INTO providers (id, name, app_type, settings_config) VALUES (?, ?, ?, ?)').run('p1', 'Tricky', 'claude', trickySettingsConfig);
+      db.prepare('INSERT INTO providers (id, name, app_type, settings_config) VALUES (?, ?, ?, ?)').run('p2', 'Plain', 'claude', '{"env":{}}');
+      db.close();
+    }
+
+    const doctorScript = path.join(rootDir, 'skills', 'claude-hud-doctor', 'scripts', 'doctor.mjs');
+    const cliEnv = {
+      ...process.env,
+      CLAUDE_CONFIG_DIR: mockClaudeDir,
+      CC_SWITCH_DB_PATH: dbPath,
+      CC_SWITCH_FORCE_CLI: '1',
+      NODE_NO_WARNINGS: '1',
+    };
+
+    // 诊断：多行 JSON 必须被精确解析为"缺失 statusLine"，而非误判"配置损坏无法解析"
+    const { stdout: diagOut } = await execPromise(`node "${doctorScript}" --json`, { env: cliEnv });
+    const diag = JSON.parse(diagOut);
+    assert.strictEqual(diag.ccSwitch.claudeProviders, 2, 'CLI 链路必须正确数出 2 个 Claude 供应商');
+    assert(
+      diag.ccSwitch.missingStatusLineProviders.some((p) => p.id === 'p1' && p.reason === '缺失 statusLine 配置'),
+      '多行 JSON 供应商必须精确诊断为缺失 statusLine（管道分隔解析会误判为配置损坏）'
+    );
+
+    // 修复：stdin 安全写入，引号/$/换行必须原样保留
+    await execPromise(`node "${doctorScript}" --fix`, { env: cliEnv });
+    const verifyDb = new sqliteModule.DatabaseSync(dbPath);
+    const rows = Object.fromEntries(
+      verifyDb.prepare("SELECT id, settings_config FROM providers WHERE app_type='claude'").all().map((r) => [r.id, r.settings_config])
+    );
+    verifyDb.close();
+
+    const p1Fixed = JSON.parse(rows.p1);
+    assert(p1Fixed.statusLine?.command.includes('statusline.mjs'), 'CLI 链路必须为多行 JSON 档案注入 statusLine');
+    assert.strictEqual(p1Fixed.env.NOTE, trickyNote, '包含引号/$/换行的环境变量必须原样保留（stdin 安全通道）');
+    assert(JSON.parse(rows.p2).statusLine?.command.includes('statusline.mjs'), 'CLI 链路必须修复普通问题档案');
+
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  // 3.9 P2：混合反斜杠不漏判 + 通用 MSYS node 绝对路径识别（替代硬编码 /d/NodeJs/node 字面量）
+  await itAsync('doctor.mjs 反斜杠混合命令不漏判，且通用 MSYS node 绝对路径被标记为脆弱', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-hud-test-'));
+    const mockClaudeDir = path.join(tmpDir, '.claude');
+    fs.mkdirSync(mockClaudeDir, { recursive: true });
+    const mockSettingsPath = path.join(mockClaudeDir, 'settings.json');
+    const doctorScript = path.join(rootDir, 'skills', 'claude-hud-doctor', 'scripts', 'doctor.mjs');
+    const sandboxEnv = {
+      ...process.env,
+      CLAUDE_CONFIG_DIR: mockClaudeDir,
+      CC_SWITCH_DB_PATH: path.join(tmpDir, 'no-such.db'),
+      NODE_NO_WARNINGS: '1',
+    };
+
+    // 场景 A：同时含转义对 \\ 与孤立 \ —— 旧启发式 includes('\\\\') 短路会漏判
+    fs.writeFileSync(
+      mockSettingsPath,
+      JSON.stringify({ statusLine: { type: 'command', command: 'node "C:\\\\shared\\\\sl.mjs" C:\\legacy' } }),
+      'utf-8'
+    );
+    const { stdout: outA } = await execPromise(`node "${doctorScript}" --json`, { env: sandboxEnv });
+    const reportA = JSON.parse(outA);
+    if (process.platform === 'win32') {
+      assert.strictEqual(reportA.settings.issue, 'contains_unescaped_backslashes', '混合转义的反斜杠命令必须被标记');
+    }
+
+    // 场景 B：无任何反斜杠，但硬编码了非标准 MSYS node 绝对路径（旧版仅识别 /d/NodeJs/node 字面量，会漏判）
+    fs.writeFileSync(
+      mockSettingsPath,
+      JSON.stringify({ statusLine: { type: 'command', command: 'node /c/custom/bin/node.exe "/c/custom/statusline.mjs"' } }),
+      'utf-8'
+    );
+    const { stdout: outB } = await execPromise(`node "${doctorScript}" --json`, { env: sandboxEnv });
+    const reportB = JSON.parse(outB);
+    if (process.platform === 'win32') {
+      assert.strictEqual(reportB.settings.issue, 'legacy_fragile_statusline', '通用 MSYS node 绝对路径必须被识别为脆弱配置');
+    }
+
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
   // 关闭服务
   await new Promise((resolve) => proxyServer.close(resolve));
   await new Promise((resolve) => mockServer.close(resolve));
