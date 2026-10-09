@@ -16,6 +16,7 @@
    - Claude Code 内置 30 秒空闲超时看门狗（`Jk = 30000ms`）。
    - 接入 DeepSeek-R1、OpenAI o1 等深度思考模型时，模型思考等待往往超过 30 秒，导致客户端直接崩溃报错 `Streaming idle timeout`。
    - 网关在等待上游首字期间，每 8 秒自动向客户端注入原生 `event: ping` 心跳帧，重置看门狗，平稳支撑 1~10 分钟超长推理！
+   - 流式请求若上游响应头迟滞（如中转排队），超过 TTFB 宽限期（默认 10s）后网关先承诺 200 SSE 并立即启动心跳，保护窗口覆盖“响应头未落地”阶段；上游 TTFB 整体超时（默认 60s）快速失败，不再无限挂起。
 
 3. **响应头工业级规范化**
    - 强制追加 `Cache-Control: no-cache, no-transform` 与 `X-Accel-Buffering: no`，杜绝 Nginx、Cloudflare 等前端反代造成的 TCP chunk 积攒与延迟卡顿。
@@ -56,11 +57,15 @@ cp proxy/config.example.json proxy/config.json
   "targetBaseUrl": "https://api.your-relay.com",
   "targetApiKey": "",
   "heartbeatIntervalMs": 8000,
-  "autoEstimateTokens": true
+  "autoEstimateTokens": true,
+  "upstreamTimeoutMs": 60000,
+  "ttfbGraceMs": 10000
 }
 ```
 
 > **注意**：如果 `targetApiKey` 留空，网关会自动透传 Claude Code 客户端传来的当前 API Key，无需重复配置！
+>
+> **TTFB 保护参数**：`ttfbGraceMs` 是“上游响应头迟迟不落地”时的提前应答宽限期（默认 10000ms，需小于 Claude Code 的 30s 看门狗）；`upstreamTimeoutMs` 是上游 TTFB 总超时（默认 60000ms），超时后非流式请求返回 504 JSON、流式请求下发 SSE error 事件。
 
 也可以直接通过环境变量启动：
 ```bash

@@ -70,6 +70,24 @@ function getStandardStatusLineCommand() {
   };
 }
 
+// 生成永不覆盖的备份 (P1-2)：首轮生成 <file>.bak 作为最初快照；
+// 此后每次修复按时间戳另存新备份，绝不用"已修复的文件"覆盖历史备份
+function createBackup(srcPath) {
+  const baseBakPath = `${srcPath}.bak`;
+  if (!fs.existsSync(baseBakPath)) {
+    fs.copyFileSync(srcPath, baseBakPath);
+    return baseBakPath;
+  }
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
+  let bakPath = `${srcPath}.bak-${stamp}`;
+  let seq = 1;
+  while (fs.existsSync(bakPath)) {
+    bakPath = `${srcPath}.bak-${stamp}-${seq++}`;
+  }
+  fs.copyFileSync(srcPath, bakPath);
+  return bakPath;
+}
+
 // 标准 statusline.mjs 脚本内容模板（若本地缺失可直接重建）
 const STATUSLINE_MJS_TEMPLATE = `// Runs the newest installed claude-hud.
 import fs from 'node:fs';
@@ -314,96 +332,129 @@ async function applyFixes() {
   const standardStatusLine = getStandardStatusLineCommand();
 
   // 4.2 修复 ~/.claude/settings.json
+  // P1-2: 备份永不覆盖（首轮 .bak，此后带时间戳）
+  // P1-3: 仅当 statusLine 缺失或被判定异常时才写入，健康的自定义配置不覆写
+  // P1-4: 文件存在但 JSON 解析失败时中止修复，绝不用空对象覆写丢弃 env 等其余配置
   try {
     fs.mkdirSync(claudeDir, { recursive: true });
-    let settings = {};
-    if (fs.existsSync(settingsPath)) {
-      // 备份
-      fs.copyFileSync(settingsPath, `${settingsPath}.bak`);
-      report.fixesApplied.push(`已备份原始 settings.json -> ${settingsPath}.bak`);
-      try {
-        settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
-      } catch {}
-    }
+    const settingsExists = fs.existsSync(settingsPath);
+    const needsWrite = !settingsExists || !report.settings.hasStatusLine || !!report.settings.issue;
 
-    settings.statusLine = standardStatusLine;
-    fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2), 'utf-8');
-    report.fixesApplied.push(`已更新 ${settingsPath}，注入跨平台安全 statusLine 命令`);
-    report.settings.hasStatusLine = true;
-    report.settings.command = standardStatusLine.command;
-    report.settings.issue = null;
+    if (!needsWrite) {
+      report.fixesApplied.push('settings.json 的 statusLine 已健康，跳过覆写（保护现有自定义配置）');
+    } else {
+      let settings = {};
+      let parseOk = true;
+      if (settingsExists) {
+        const bakPath = createBackup(settingsPath);
+        report.fixesApplied.push(`已备份原始 settings.json -> ${bakPath}`);
+        try {
+          settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
+        } catch (err) {
+          parseOk = false;
+          const msg = `settings.json JSON 解析失败（${err.message}），已中止自动修复以免清空 env 等其余配置；请先手动修复 JSON 语法后重试。原始文件与备份均未改动（备份: ${bakPath}）`;
+          report.fixesApplied.push(`[已跳过] ${msg}`);
+          console.error(`\n${c.red}${c.bold}[ABORT] ${msg}${c.reset}\n`);
+        }
+      }
+      if (parseOk) {
+        settings.statusLine = standardStatusLine;
+        fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2), 'utf-8');
+        report.fixesApplied.push(`已更新 ${settingsPath}，注入跨平台安全 statusLine 命令`);
+        report.settings.hasStatusLine = true;
+        report.settings.command = standardStatusLine.command;
+        report.settings.issue = null;
+      }
+    }
   } catch (err) {
     report.fixesApplied.push(`修复 settings.json 失败: ${err.message}`);
   }
 
   // 4.3 修复 cc-switch.db
+  // P1-2: 备份永不覆盖（首轮 .bak，此后带时间戳）
+  // P1-3: 仅修复诊断出的问题档案，健康的自定义 statusLine 不覆写
+  const problemIds = new Set(report.ccSwitch.missingStatusLineProviders.map((p) => p.id));
   if (report.ccSwitch.installed) {
-    try {
-      // 备份数据库
-      fs.copyFileSync(ccSwitchDbPath, `${ccSwitchDbPath}.bak`);
-      report.fixesApplied.push(`已备份原始 cc-switch.db -> ${ccSwitchDbPath}.bak`);
-
-      let DatabaseSync;
+    if (problemIds.size === 0 && report.ccSwitch.commonConfigHasStatusLine) {
+      report.fixesApplied.push('cc-switch 中所有 Claude 供应商档案与全局配置均已健康，跳过数据库覆写');
+    } else {
       try {
-        const sqlite = await import('node:sqlite');
-        DatabaseSync = sqlite.DatabaseSync;
-      } catch {}
+        // 备份数据库
+        const dbBakPath = createBackup(ccSwitchDbPath);
+        report.fixesApplied.push(`已备份原始 cc-switch.db -> ${dbBakPath}`);
 
-      if (DatabaseSync) {
-        const db = new DatabaseSync(ccSwitchDbPath);
-        
-        // 更新所有缺失 statusLine 的 Claude Provider
-        const providers = db.prepare("SELECT id, name, settings_config FROM providers WHERE app_type = 'claude'").all();
-        let updatedCount = 0;
-        for (const p of providers) {
-          try {
-            const cfg = JSON.parse(p.settings_config || '{}');
-            cfg.statusLine = standardStatusLine;
-            const newJson = JSON.stringify(cfg);
-            db.prepare("UPDATE providers SET settings_config = ? WHERE id = ?").run(newJson, p.id);
-            updatedCount++;
-          } catch {}
-        }
-
-        // 更新全局 common_config_claude
+        let DatabaseSync;
         try {
-          const row = db.prepare("SELECT value FROM settings WHERE key = 'common_config_claude'").get();
-          let common = {};
-          if (row && row.value) {
-            try { common = JSON.parse(row.value); } catch {}
-          }
-          common.statusLine = standardStatusLine;
-          db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('common_config_claude', ?)").run(JSON.stringify(common));
+          const sqlite = await import('node:sqlite');
+          DatabaseSync = sqlite.DatabaseSync;
         } catch {}
 
-        db.close();
-        report.fixesApplied.push(`已在 cc-switch.db 中成功固化 ${updatedCount} 个供应商档案及全局配置中的 statusLine！`);
-        report.ccSwitch.missingStatusLineProviders = [];
-      } else {
-        // 降级使用 sqlite3 CLI
-        try {
-          const rowsRaw = execSync(`sqlite3 "${ccSwitchDbPath}" "SELECT id, settings_config FROM providers WHERE app_type='claude';"`, {
-            encoding: 'utf-8',
-          });
-          const lines = rowsRaw.trim().split(/\r?\n/).filter(Boolean);
-          for (const line of lines) {
-            const [id, ...rest] = line.split('|');
-            const cfgJson = rest.join('|');
+        if (DatabaseSync) {
+          const db = new DatabaseSync(ccSwitchDbPath);
+          const providers = db.prepare("SELECT id, name, settings_config FROM providers WHERE app_type = 'claude'").all();
+          let updatedCount = 0;
+          const unableToFix = [];
+          for (const p of providers) {
+            if (!problemIds.has(p.id)) continue; // 健康档案保持原样，不覆写
             try {
-              const cfg = JSON.parse(cfgJson);
+              const cfg = JSON.parse(p.settings_config || '{}');
               cfg.statusLine = standardStatusLine;
-              const escaped = JSON.stringify(cfg).replace(/'/g, "''");
-              execSync(`sqlite3 "${ccSwitchDbPath}" "UPDATE providers SET settings_config='${escaped}' WHERE id='${id}';"`);
-            } catch {}
+              db.prepare("UPDATE providers SET settings_config = ? WHERE id = ?").run(JSON.stringify(cfg), p.id);
+              updatedCount++;
+            } catch {
+              unableToFix.push({ id: p.id, name: p.name, reason: '配置损坏无法解析，未修复' });
+            }
           }
-          report.fixesApplied.push(`通过 sqlite3 CLI 批量修复了 cc-switch 供应商档案中的 statusLine`);
-          report.ccSwitch.missingStatusLineProviders = [];
-        } catch (cliErr) {
-          report.fixesApplied.push(`cc-switch 自动修复降级失败: ${cliErr.message}`);
+
+          // 更新全局 common_config_claude（解析失败时中止写入，防止清空其余全局配置）
+          let commonParseOk = true;
+          try {
+            const row = db.prepare("SELECT value FROM settings WHERE key = 'common_config_claude'").get();
+            let common = {};
+            if (row && row.value) {
+              try {
+                common = JSON.parse(row.value);
+              } catch (err) {
+                commonParseOk = false;
+                console.error(`${c.yellow}[WARN]${c.reset} common_config_claude JSON 解析失败（${err.message}），已跳过覆写以防清空其余全局配置`);
+              }
+            }
+            if (commonParseOk) {
+              common.statusLine = standardStatusLine;
+              db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('common_config_claude', ?)").run(JSON.stringify(common));
+            }
+          } catch {}
+
+          db.close();
+          report.fixesApplied.push(`已在 cc-switch.db 中固化 ${updatedCount} 个问题供应商档案及全局配置的 statusLine（健康档案保持不变）`);
+          report.ccSwitch.missingStatusLineProviders = unableToFix;
+        } else {
+          // 降级使用 sqlite3 CLI（同样仅修复问题档案）
+          try {
+            const rowsRaw = execSync(`sqlite3 "${ccSwitchDbPath}" "SELECT id, settings_config FROM providers WHERE app_type='claude';"`, {
+              encoding: 'utf-8',
+            });
+            const lines = rowsRaw.trim().split(/\r?\n/).filter(Boolean);
+            for (const line of lines) {
+              const [id, ...rest] = line.split('|');
+              if (!problemIds.has(id)) continue;
+              const cfgJson = rest.join('|');
+              try {
+                const cfg = JSON.parse(cfgJson);
+                cfg.statusLine = standardStatusLine;
+                const escaped = JSON.stringify(cfg).replace(/'/g, "''");
+                execSync(`sqlite3 "${ccSwitchDbPath}" "UPDATE providers SET settings_config='${escaped}' WHERE id='${id}';"`);
+              } catch {}
+            }
+            report.fixesApplied.push(`通过 sqlite3 CLI 修复了 cc-switch 问题供应商档案中的 statusLine`);
+            report.ccSwitch.missingStatusLineProviders = [];
+          } catch (cliErr) {
+            report.fixesApplied.push(`cc-switch 自动修复降级失败: ${cliErr.message}`);
+          }
         }
+      } catch (err) {
+        report.fixesApplied.push(`修复 cc-switch 失败: ${err.message}`);
       }
-    } catch (err) {
-      report.fixesApplied.push(`修复 cc-switch 失败: ${err.message}`);
     }
   }
 }

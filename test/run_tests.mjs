@@ -15,12 +15,17 @@
  *    - 模型长思考时自动注入 event: ping 心跳保活 (防 30s 崩溃)
  *    - 响应头规范化与上游压缩抑制 (Accept-Encoding: identity)
  *    - 上游连接异常 502 错误优雅处理
+ *    - 合规上游首包真实 input_tokens 不被尾包估算值污染 (P0-1)
+ *    - TTFB 迟滞时提前承诺 SSE 并前置心跳 / 黑洞上游超时快速失败 (P0-2)
+ *    - 上游中途断开 (FIN / SSE abort) 优雅收尾，杜绝挂死 (P1-1)
  * 5. CLI 命令行脚本验证:
  *    - doctor.mjs --json 运行
  *    - doctor.mjs --fix 沙箱端到端自愈验证 (备份、修复 settings.json、固化 cc-switch.db)
+ *    - doctor --fix 备份永不覆盖 / 仅修问题档案 / 解析失败中止 (P1-2/3/4)
  *    - probe_api.mjs 对准缺陷上游精准判定 FAIL
  *    - probe_api.mjs 对准 Proxy 精准判定 PASS
  *    - probe_api.mjs 传入 /v1 地址时不发生双重拼接
+ *    - probe 跨域重定向剥离认证头、同源重定向保留 (P1-5)
  */
 
 import http from 'node:http';
@@ -82,6 +87,18 @@ async function itAsync(name, fn) {
     console.error(`  ${c.red}✘ FAIL${c.reset} ${name}`);
     console.error(err);
     process.exitCode = 1;
+  }
+}
+
+// 从 SSE 响应文本中提取指定事件的数据 JSON（用于断言首包/尾包字段）
+function extractEventData(streamText, eventName) {
+  const re = new RegExp(`event:\\s*${eventName}\\s*\\r?\\n(data:[^\\n]+)`);
+  const m = re.exec(streamText);
+  if (!m) return null;
+  try {
+    return JSON.parse(m[1].replace(/^data:\s*/, ''));
+  } catch {
+    return null;
   }
 }
 
@@ -192,11 +209,40 @@ async function runProxyTests() {
       req.on('end', async () => {
         const parsed = JSON.parse(body || '{}');
 
+        // 黑洞模式：故意永不返回任何响应（测试上游 TTFB 超时保护）
+        if (parsed.black_hole_mode) {
+          return;
+        }
+
         if (parsed.stream) {
+          // TTFB 迟滞模式：响应头前静默 1500ms（测试提前承诺 SSE + 心跳前置）
+          if (parsed.ttfb_stall_mode) {
+            await sleep(1500);
+          }
           res.writeHead(200, {
             'Content-Type': 'text/event-stream; charset=utf-8',
             'Connection': 'keep-alive',
           });
+
+          // 合规上游模式：首包携带真实 input_tokens，尾包不含 input_tokens (P0-1)
+          if (parsed.compliant_tail_mode) {
+            res.write('event: message_start\ndata: {"type":"message_start","message":{"id":"msg_compliant","type":"message","role":"assistant","model":"mock-model","content":[],"usage":{"input_tokens":4871,"output_tokens":1}}}\n\n');
+            res.write('event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\n');
+            res.write('event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}\n\n');
+            res.write('event: message_stop\ndata: {"type":"message_stop"}\n\n');
+            res.end();
+            return;
+          }
+
+          // SSE 中途断开模式：已透传部分事件后 FIN 断开，无 message_stop (P1-1)
+          if (parsed.sse_abort_mode) {
+            res.on('error', () => {});
+            res.write('event: message_start\ndata: {"type":"message_start","message":{"id":"msg_abort","type":"message","role":"assistant","usage":{"input_tokens":0}}}\n\n');
+            res.write('event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}\n\n');
+            await sleep(50);
+            res.socket?.end(); // 中途 FIN 断开
+            return;
+          }
 
           // 场景 1：CRLF 测试流
           if (parsed.crlf_mode) {
@@ -241,6 +287,15 @@ async function runProxyTests() {
           res.write('event: message_stop\ndata: {"type":"message_stop"}\n\n');
           res.end();
         } else {
+          // 非流式中途断开模式：已发送部分 body 后 FIN 断开 (P1-1)
+          if (parsed.abort_mid_body_mode) {
+            res.on('error', () => {});
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.write('{"id":"msg_partial","usage":{"input_tokens":5,');
+            await sleep(50);
+            res.socket?.end(); // 中途 FIN 断开
+            return;
+          }
           // 非流式
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({
@@ -267,6 +322,7 @@ async function runProxyTests() {
     targetBaseUrl: `http://127.0.0.1:${MOCK_UPSTREAM_PORT}/v1`,
     heartbeatIntervalMs: 500, // 500ms 快速心跳便于单测
     autoEstimateTokens: true,
+    ttfbGraceMs: 300, // TTFB 宽限期缩短便于单测
   });
 
   await new Promise((resolve) => proxyServer.listen(PROXY_TEST_PORT, '127.0.0.1', resolve));
@@ -402,10 +458,204 @@ async function runProxyTests() {
     await new Promise((resolve) => deadPortProxy.close(resolve));
   });
 
+  // 2.8 P0-1：合规上游（首包带真实 input_tokens）的尾包不得被估算值污染
+  await itAsync('合规上游首包真实 input_tokens 原样透传，尾包不被注入估算值 (P0-1)', async () => {
+    const res = await fetch(`http://127.0.0.1:${PROXY_TEST_PORT}/v1/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'mock-model',
+        messages: [{ role: 'user', content: 'compliant test' }],
+        stream: true,
+        compliant_tail_mode: true,
+      }),
+    });
+
+    assert.strictEqual(res.status, 200);
+    const streamText = await res.text();
+    assert(streamText.includes('"input_tokens":4871'), '合规首包的真实 input_tokens 必须原样透传');
+
+    const count = (streamText.match(/"input_tokens"/g) || []).length;
+    assert.strictEqual(count, 1, `合规流中 input_tokens 只应出现在首包一次，实际出现 ${count} 次`);
+
+    const delta = extractEventData(streamText, 'message_delta');
+    assert(delta, '必须能解析出 message_delta 事件');
+    assert(delta.usage && delta.usage.input_tokens === undefined, '合规上游尾包不得被注入估算 input_tokens');
+    assert.strictEqual(delta.usage.output_tokens, 5, '尾包其余字段必须原样保留');
+  });
+
+  // 2.9 P0-1：不合规上游（首包缺失）的尾包双保注入依然生效
+  await itAsync('不合规上游的尾包双保注入依然生效（与首包估算值一致）(P0-1)', async () => {
+    const res = await fetch(`http://127.0.0.1:${PROXY_TEST_PORT}/v1/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'mock-model',
+        messages: [{ role: 'user', content: 'fallback test' }],
+        stream: true,
+      }),
+    });
+
+    assert.strictEqual(res.status, 200);
+    const streamText = await res.text();
+    const start = extractEventData(streamText, 'message_start');
+    const delta = extractEventData(streamText, 'message_delta');
+    assert(start && delta, '必须能解析出首包与尾包');
+    assert(start.message.usage.input_tokens > 0, '首包应被补丁为 > 0');
+    assert.strictEqual(
+      delta.usage?.input_tokens,
+      start.message.usage.input_tokens,
+      '尾包应注入与首包一致的估算值（估算口径一致）'
+    );
+  });
+
+  // 2.10 P0-2：上游 TTFB 迟滞时提前承诺 SSE 并前置心跳
+  await itAsync('上游 TTFB 迟滞时提前承诺 200 SSE，ping 先于 message_start 下发 (P0-2)', async () => {
+    const t0 = Date.now();
+    const res = await fetch(`http://127.0.0.1:${PROXY_TEST_PORT}/v1/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'mock-model',
+        messages: [{ role: 'user', content: 'ttfb stall' }],
+        stream: true,
+        ttfb_stall_mode: true,
+      }),
+    });
+    const headerMs = Date.now() - t0;
+
+    assert.strictEqual(res.status, 200);
+    const streamText = await res.text();
+    const pingIdx = streamText.indexOf('event: ping');
+    const startIdx = streamText.indexOf('event: message_start');
+    assert(pingIdx !== -1, 'TTFB 迟滞期必须有保活心跳下发');
+    assert(startIdx !== -1, '迟滞结束后仍须完整透传 message_start');
+    assert(pingIdx < startIdx, `心跳必须先于上游首包到达（ping@${pingIdx}, message_start@${startIdx}）`);
+    assert(headerMs < 1400, `响应头必须在上游 1500ms 迟滞结束前提前落地，实际 ${headerMs}ms`);
+  });
+
+  // 2.11 / 2.12 P0-2：黑洞上游（永不响应）的快速失败
+  const ttfbProxy = createProxyServer({
+    port: 19197,
+    host: '127.0.0.1',
+    targetBaseUrl: `http://127.0.0.1:${MOCK_UPSTREAM_PORT}`,
+    upstreamTimeoutMs: 700, // 短超时便于单测
+    ttfbGraceMs: 200,
+    heartbeatIntervalMs: 300,
+  });
+  await new Promise((resolve) => ttfbProxy.listen(19197, '127.0.0.1', resolve));
+
+  await itAsync('上游黑洞时非流式请求快速失败为 504 而非永久挂死 (P0-2)', async () => {
+    const t0 = Date.now();
+    const res = await fetch('http://127.0.0.1:19197/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'mock', messages: [], stream: false, black_hole_mode: true }),
+      signal: AbortSignal.timeout(5000),
+    });
+    assert.strictEqual(res.status, 504, `黑洞上游必须快速返回 504，实际 ${res.status}`);
+    const json = await res.json();
+    assert.strictEqual(json.error.type, 'gateway_error');
+    assert(Date.now() - t0 < 3000, '必须在超时保护内快速返回');
+  });
+
+  await itAsync('上游黑洞时流式请求以下发 SSE error 事件优雅收尾 (P0-2)', async () => {
+    const res = await fetch('http://127.0.0.1:19197/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'mock', messages: [], stream: true, black_hole_mode: true }),
+      signal: AbortSignal.timeout(5000),
+    });
+    assert.strictEqual(res.status, 200, '流式请求已提前承诺 200 SSE');
+    const text = await res.text();
+    assert(text.includes('event: error'), '黑洞上游必须以 SSE error 事件收尾而非挂死');
+  });
+
+  await new Promise((resolve) => ttfbProxy.close(resolve));
+
+  // 2.13 / 2.14 P1-1：上游中途断开（FIN）的优雅收尾
+  await itAsync('场景 B 上游中途断开（FIN）时客户端快速收到 502 而非挂死 (P1-1)', async () => {
+    const res = await fetch(`http://127.0.0.1:${PROXY_TEST_PORT}/v1/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'mock', messages: [], stream: false, abort_mid_body_mode: true }),
+      signal: AbortSignal.timeout(5000),
+    });
+    assert.strictEqual(res.status, 502, `上游中途断开必须快速 502，实际 ${res.status}`);
+    const json = await res.json();
+    assert.strictEqual(json.error.type, 'gateway_error');
+  });
+
+  await itAsync('SSE 流中途断开时以下发 event: error 优雅收尾 (P1-1)', async () => {
+    const res = await fetch(`http://127.0.0.1:${PROXY_TEST_PORT}/v1/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'mock', messages: [], stream: true, sse_abort_mode: true }),
+      signal: AbortSignal.timeout(5000),
+    });
+    assert.strictEqual(res.status, 200);
+    const text = await res.text();
+    assert(text.includes('event: error'), 'SSE 中途断开必须以 error 事件收尾而非挂死');
+    assert(text.includes('msg_abort'), '中断前已透传的事件必须保留');
+  });
+
   // ==========================================
   // [测试组 3] CLI 命令行脚本与探针端到端闭环验证
   // ==========================================
   console.log(`\n${c.bold}[测试组 3] CLI 命令行脚本与探针端到端闭环验证${c.reset}`);
+
+  // P1-5 重定向测试专用 Mock：跨域目标服务器 + 同源/跨域重定向源服务器
+  const PROBE_REDIRECT_PORT = 19193;
+  const PROBE_REDIRECT_TARGET_PORT = 19194;
+  let crossOriginCapturedHeaders = null;
+  let sameOriginCapturedHeaders = null;
+
+  const writeCompliantSse = (res) => {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      'X-Accel-Buffering': 'no',
+    });
+    res.write('event: message_start\ndata: {"type":"message_start","message":{"id":"msg_redir","type":"message","role":"assistant","model":"mock","content":[],"usage":{"input_tokens":321,"output_tokens":1}}}\n\n');
+    res.write('event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}\n\n');
+    res.write('event: message_stop\ndata: {"type":"message_stop"}\n\n');
+    res.end();
+  };
+
+  const redirectTargetServer = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      crossOriginCapturedHeaders = req.headers;
+      writeCompliantSse(res);
+    });
+  });
+  await new Promise((resolve) => redirectTargetServer.listen(PROBE_REDIRECT_TARGET_PORT, '127.0.0.1', resolve));
+
+  const redirectSourceServer = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      if (req.url.startsWith('/same/')) {
+        if (req.url.includes('hop=2')) {
+          sameOriginCapturedHeaders = req.headers;
+          writeCompliantSse(res);
+          return;
+        }
+        res.writeHead(302, { Location: '/same/v1/messages?hop=2' });
+        res.end();
+        return;
+      }
+      if (req.url.startsWith('/cross/')) {
+        res.writeHead(302, { Location: `http://127.0.0.1:${PROBE_REDIRECT_TARGET_PORT}/v1/messages` });
+        res.end();
+        return;
+      }
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end('{"error":"not_found"}');
+    });
+  });
+  await new Promise((resolve) => redirectSourceServer.listen(PROBE_REDIRECT_PORT, '127.0.0.1', resolve));
 
   // 3.1 探针直接针对缺陷上游测试 (必须判决为 FAIL)
   await itAsync('probe_api.mjs 对准缺陷上游时精准裁决为 FAIL 并指出 input_tokens: 0', async () => {
@@ -438,6 +688,32 @@ async function runProxyTests() {
     const report = JSON.parse(stdout);
     assert.strictEqual(report.verdict, 'PASS', `带 /v1 的 base-url 必须裁决为 PASS，实际: ${report.verdict}`);
     assert(report.targetUrl.endsWith('/v1/messages'), `目标 URL 不能出现 /v1/v1/messages，实际: ${report.targetUrl}`);
+  });
+
+  // 3.4 P1-5：跨域重定向必须剥离认证头，同源重定向必须保留
+  await itAsync('probe_api.mjs 跨域重定向时剥离认证头，防止 API Key 泄漏 (P1-5)', async () => {
+    const probeScript = path.join(rootDir, 'skills', 'claude-hud-doctor', 'scripts', 'probe_api.mjs');
+    const { stdout } = await execPromise(
+      `node "${probeScript}" --base-url "http://127.0.0.1:${PROBE_REDIRECT_PORT}/cross" --api-key "leak-test-key" --json`
+    );
+    const report = JSON.parse(stdout);
+    assert.strictEqual(report.verdict, 'PASS', `重定向到合规 SSE 后仍应正常裁决，实际: ${report.verdict}`);
+    assert(crossOriginCapturedHeaders, '跨域目标服务器必须收到重定向后的请求');
+    assert.strictEqual(crossOriginCapturedHeaders['x-api-key'], undefined, '跨域重定向不得携带 x-api-key');
+    assert.strictEqual(crossOriginCapturedHeaders['authorization'], undefined, '跨域重定向不得携带 authorization');
+    assert.strictEqual(crossOriginCapturedHeaders['anthropic-auth-token'], undefined, '跨域重定向不得携带 anthropic-auth-token');
+    assert(report.recommendations.some((r) => r.includes('跨域')), '报告中必须提示跨域重定向已剥离凭证');
+  });
+
+  await itAsync('probe_api.mjs 同源重定向时保留认证头 (P1-5)', async () => {
+    const probeScript = path.join(rootDir, 'skills', 'claude-hud-doctor', 'scripts', 'probe_api.mjs');
+    const { stdout } = await execPromise(
+      `node "${probeScript}" --base-url "http://127.0.0.1:${PROBE_REDIRECT_PORT}/same" --api-key "keep-test-key" --json`
+    );
+    const report = JSON.parse(stdout);
+    assert.strictEqual(report.verdict, 'PASS', `同源重定向后必须正常裁决，实际: ${report.verdict}`);
+    assert(sameOriginCapturedHeaders, '同源目标必须收到重定向后的请求');
+    assert.strictEqual(sameOriginCapturedHeaders['x-api-key'], 'keep-test-key', '同源重定向必须保留认证头');
   });
 
   // 3.3 doctor.mjs --json 运行
@@ -537,9 +813,141 @@ async function runProxyTests() {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
+  // 3.5 P1-2：备份永不覆盖（首轮 .bak 保存最初快照，后续修复带时间戳另存）
+  await itAsync('doctor.mjs --fix 二次运行时最初 .bak 不被覆盖，并生成时间戳备份 (P1-2)', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-hud-test-'));
+    const mockClaudeDir = path.join(tmpDir, '.claude');
+    fs.mkdirSync(mockClaudeDir, { recursive: true });
+    const mockSettingsPath = path.join(mockClaudeDir, 'settings.json');
+    const v1 = JSON.stringify({ statusLine: { type: 'command', command: 'C:\\broken\\v1.mjs' } });
+    fs.writeFileSync(mockSettingsPath, v1, 'utf-8');
+
+    const doctorScript = path.join(rootDir, 'skills', 'claude-hud-doctor', 'scripts', 'doctor.mjs');
+    const sandboxEnv = {
+      ...process.env,
+      CLAUDE_CONFIG_DIR: mockClaudeDir,
+      CC_SWITCH_DB_PATH: path.join(tmpDir, 'no-such.db'),
+      NODE_NO_WARNINGS: '1',
+    };
+
+    await execPromise(`node "${doctorScript}" --fix`, { env: sandboxEnv });
+    assert.strictEqual(fs.readFileSync(`${mockSettingsPath}.bak`, 'utf-8'), v1, '首轮 .bak 必须等于最初原始内容');
+
+    // 第二轮前再次改坏（模拟用户再次手工修改配置）
+    const v2 = JSON.stringify({ statusLine: { type: 'command', command: 'cmd.exe /c C:\\bad\\v2.mjs' } });
+    fs.writeFileSync(mockSettingsPath, v2, 'utf-8');
+    await execPromise(`node "${doctorScript}" --fix`, { env: sandboxEnv });
+
+    assert.strictEqual(fs.readFileSync(`${mockSettingsPath}.bak`, 'utf-8'), v1, '第二轮不得用新内容覆盖最初 .bak');
+    const tsBackups = fs.readdirSync(mockClaudeDir).filter((f) => f.startsWith('settings.json.bak-'));
+    assert(tsBackups.length >= 1, '第二轮修复必须生成带时间戳的新备份');
+    assert.strictEqual(
+      fs.readFileSync(path.join(mockClaudeDir, tsBackups[0]), 'utf-8'),
+      v2,
+      '时间戳备份内容应为第二轮修复前的当前文件'
+    );
+
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  // 3.6 P1-3：仅修复问题档案，健康的自定义 statusLine 不被覆写
+  await itAsync('doctor.mjs --fix 不覆写健康的自定义 statusLine（settings 与 Provider 双保险）(P1-3)', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-hud-test-'));
+    const mockClaudeDir = path.join(tmpDir, '.claude');
+    fs.mkdirSync(mockClaudeDir, { recursive: true });
+    const mockSettingsPath = path.join(mockClaudeDir, 'settings.json');
+    const healthyCustomCmd = 'node "C:/custom/my-statusline.js"';
+    fs.writeFileSync(
+      mockSettingsPath,
+      JSON.stringify({
+        env: { ANTHROPIC_BASE_URL: 'https://relay.example.com' },
+        statusLine: { type: 'command', command: healthyCustomCmd },
+      }),
+      'utf-8'
+    );
+
+    const dbPath = path.join(tmpDir, 'mock-cc-switch.db');
+    let sqliteModule;
+    try {
+      sqliteModule = await import('node:sqlite');
+    } catch {}
+
+    if (sqliteModule?.DatabaseSync) {
+      const healthyProviderCfg = '{"env":{},"statusLine":{"type":"command","command":"node \\"C:/custom/other-statusline.js\\""}}';
+      const db = new sqliteModule.DatabaseSync(dbPath);
+      db.exec(`
+        CREATE TABLE providers (id TEXT PRIMARY KEY, name TEXT, app_type TEXT, settings_config TEXT);
+        CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);
+      `);
+      db.prepare(`
+        INSERT INTO providers (id, name, app_type, settings_config) VALUES 
+        ('p1', 'Missing Provider', 'claude', '{"env":{}}'),
+        ('p2', 'Risky Provider', 'claude', '{"statusLine":{"type":"command","command":"cmd.exe /c node C:\\\\foo\\\\bar.mjs"}}')
+      `).run();
+      db.prepare('INSERT INTO providers (id, name, app_type, settings_config) VALUES (?, ?, ?, ?)').run('p3', 'Healthy Custom', 'claude', healthyProviderCfg);
+      db.close();
+
+      const doctorScript = path.join(rootDir, 'skills', 'claude-hud-doctor', 'scripts', 'doctor.mjs');
+      await execPromise(`node "${doctorScript}" --fix`, {
+        env: {
+          ...process.env,
+          CLAUDE_CONFIG_DIR: mockClaudeDir,
+          CC_SWITCH_DB_PATH: dbPath,
+          NODE_NO_WARNINGS: '1',
+        },
+      });
+
+      // settings.json：健康的自定义 statusLine 与其余配置都不能被动
+      const fixedSettings = JSON.parse(fs.readFileSync(mockSettingsPath, 'utf-8'));
+      assert.strictEqual(fixedSettings.statusLine.command, healthyCustomCmd, '健康自定义 statusLine 不得被覆写');
+      assert.strictEqual(fixedSettings.env.ANTHROPIC_BASE_URL, 'https://relay.example.com', '其余配置必须保留');
+
+      // cc-switch.db：p3 原样保留，p1/p2 被修复
+      const verifyDb = new sqliteModule.DatabaseSync(dbPath);
+      const rows = Object.fromEntries(
+        verifyDb.prepare("SELECT id, settings_config FROM providers WHERE app_type='claude'").all().map((r) => [r.id, r.settings_config])
+      );
+      verifyDb.close();
+      assert.strictEqual(rows.p3, healthyProviderCfg, '健康档案必须原样保留（不得被 UPDATE 覆写）');
+      assert(JSON.parse(rows.p1).statusLine?.command.includes('statusline.mjs'), '缺失档案必须被修复');
+      assert(JSON.parse(rows.p2).statusLine?.command.includes('statusline.mjs'), '风险档案必须被修复');
+    }
+
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  // 3.7 P1-4：损坏的 settings.json 必须中止修复而非清空重写
+  await itAsync('doctor.mjs --fix 遇损坏 settings.json 时中止修复，其余配置不被清空 (P1-4)', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-hud-test-'));
+    const mockClaudeDir = path.join(tmpDir, '.claude');
+    fs.mkdirSync(mockClaudeDir, { recursive: true });
+    const mockSettingsPath = path.join(mockClaudeDir, 'settings.json');
+    // 尾逗号导致 JSON 非法（JSONC 风格），doctor 必须中止而不是覆写成空对象
+    const brokenContent = '{\n  "env": { "ANTHROPIC_BASE_URL": "https://relay.example.com", },\n}';
+    fs.writeFileSync(mockSettingsPath, brokenContent, 'utf-8');
+
+    const doctorScript = path.join(rootDir, 'skills', 'claude-hud-doctor', 'scripts', 'doctor.mjs');
+    const { stdout } = await execPromise(`node "${doctorScript}" --fix --json`, {
+      env: {
+        ...process.env,
+        CLAUDE_CONFIG_DIR: mockClaudeDir,
+        CC_SWITCH_DB_PATH: path.join(tmpDir, 'no-such.db'),
+        NODE_NO_WARNINGS: '1',
+      },
+    });
+    const report = JSON.parse(stdout);
+    assert.strictEqual(fs.readFileSync(mockSettingsPath, 'utf-8'), brokenContent, '损坏的 settings.json 必须原样保留，绝不能被清空重写');
+    assert(report.fixesApplied.some((s) => s.includes('解析失败')), '报告必须明确提示解析失败并已跳过修复');
+    assert(fs.existsSync(`${mockSettingsPath}.bak`), '中止前仍须保留备份');
+
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
   // 关闭服务
   await new Promise((resolve) => proxyServer.close(resolve));
   await new Promise((resolve) => mockServer.close(resolve));
+  await new Promise((resolve) => redirectSourceServer.close(resolve));
+  await new Promise((resolve) => redirectTargetServer.close(resolve));
 }
 
 runProxyTests()

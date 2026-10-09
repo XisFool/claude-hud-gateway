@@ -9,6 +9,8 @@
  * 2. 【30s 超时防崩心跳保活】：
  *    当接入 DeepSeek-R1、o1 等深度思考模型时，超过 8 秒未吐字自动下发
  *    event: ping 心跳帧，重置 Claude Code 内部 30s 看门狗，杜绝断流崩溃。
+ *    流式请求若上游响应头迟滞超过 TTFB 宽限期，网关先承诺 200 SSE 并立即启动心跳，
+ *    让保护窗口覆盖“响应头未落地”阶段；上游 TTFB 超时可配置，黑洞上游不再永久挂死。
  * 3. 【响应头工业级规范化】：
  *    补齐 Cache-Control: no-cache, no-transform 与 X-Accel-Buffering: no，消除反向代理积攒延迟。
  * 4. 【零依赖与高性能】：
@@ -90,6 +92,8 @@ function loadConfig() {
   const heartbeatIntervalMs = Number.parseInt(process.env.HEARTBEAT_INTERVAL_MS || fileConfig.heartbeatIntervalMs || '8000', 10);
   const autoEstimateTokens = process.env.AUTO_ESTIMATE_TOKENS !== 'false' && (fileConfig.autoEstimateTokens !== false);
   const tokenEstimateRatio = Number.parseFloat(process.env.TOKEN_ESTIMATE_RATIO || fileConfig.tokenEstimateRatio || '2.5');
+  const upstreamTimeoutMs = Number.parseInt(process.env.UPSTREAM_TIMEOUT_MS || fileConfig.upstreamTimeoutMs || '60000', 10);
+  const ttfbGraceMs = Number.parseInt(process.env.TTFB_GRACE_MS || fileConfig.ttfbGraceMs || '10000', 10);
 
   return {
     port,
@@ -99,6 +103,8 @@ function loadConfig() {
     heartbeatIntervalMs,
     autoEstimateTokens,
     tokenEstimateRatio: Number.isNaN(tokenEstimateRatio) ? 2.5 : tokenEstimateRatio,
+    upstreamTimeoutMs: Number.isNaN(upstreamTimeoutMs) ? 60000 : upstreamTimeoutMs,
+    ttfbGraceMs: Number.isNaN(ttfbGraceMs) ? 10000 : ttfbGraceMs,
   };
 }
 
@@ -221,6 +227,10 @@ export function createProxyServer(customConfig = {}) {
     }
 
     // 收集客户端请求体
+    // P1-1: 客户端中途掐断上传等入站错误就地消化，防止升级为进程级未捕获异常
+    req.on('error', (err) => {
+      console.warn(`${c.yellow}[WARN #${requestId}]${c.reset} 客户端请求流异常: ${err.message}`);
+    });
     const bodyChunks = [];
     req.on('data', (chunk) => bodyChunks.push(chunk));
     req.on('end', () => {
@@ -266,6 +276,112 @@ export function createProxyServer(customConfig = {}) {
 
       let clientClosed = false;
       let streamClosed = false;
+      let streamCounted = false;
+      let headersCommitted = false;
+      let upstreamResponded = false;
+      let streamFailed = false;
+      let heartbeatTimer = null;
+      let graceTimer = null;
+      let lastChunkTime = Date.now();
+      let sseBuffer = '';
+      const patchState = { startPatched: false };
+
+      const checkInterval = Math.min(1000, Math.max(200, Math.floor(mergedConfig.heartbeatIntervalMs / 2)));
+
+      // 流级清理（幂等）：停止心跳/宽限计时器，并归还活跃流计数
+      const cleanupStream = () => {
+        if (streamClosed) return;
+        streamClosed = true;
+        if (heartbeatTimer) {
+          clearInterval(heartbeatTimer);
+          heartbeatTimer = null;
+        }
+        if (graceTimer) {
+          clearTimeout(graceTimer);
+          graceTimer = null;
+        }
+        if (streamCounted) {
+          stats.activeStreams = Math.max(0, stats.activeStreams - 1);
+          streamCounted = false;
+        }
+      };
+
+      // 【功能 2：30s 看门狗保活心跳定时器】
+      // 自 SSE 响应承诺一刻启动，同时覆盖“上游响应头迟滞”与“长思考静默”两个无字节窗口
+      const startHeartbeat = () => {
+        lastChunkTime = Date.now();
+        heartbeatTimer = setInterval(() => {
+          if (clientClosed || res.writableEnded) {
+            cleanupStream();
+            return;
+          }
+          const idleMs = Date.now() - lastChunkTime;
+          if (idleMs >= mergedConfig.heartbeatIntervalMs) {
+            res.write('event: ping\ndata: {"type":"ping"}\n\n');
+            lastChunkTime = Date.now();
+            stats.heartbeatsSentTotal++;
+            console.log(`${c.magenta}[HEARTBEAT #${requestId}]${c.reset} 长静默期，已下发保活心跳 event: ping (防 30s 崩溃)`);
+          }
+        }, checkInterval);
+      };
+
+      // 向客户端承诺 SSE 响应头（合并上游头或使用标准头），并立即启动心跳
+      const commitSseResponse = (status, upstreamHeaders = {}) => {
+        headersCommitted = true;
+        if (!streamCounted) {
+          streamCounted = true;
+          stats.activeStreams++;
+        }
+        const responseHeaders = {
+          ...upstreamHeaders,
+          'Content-Type': 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-cache, no-transform',
+          'Connection': 'keep-alive',
+          'X-Accel-Buffering': 'no',
+        };
+        delete responseHeaders['content-length'];
+        delete responseHeaders['transfer-encoding'];
+        res.writeHead(status, responseHeaders);
+        startHeartbeat();
+      };
+
+      // 统一的流终局错误路径（幂等）：已承诺 SSE 则回写 SSE error 事件；未承诺则按 502/504 JSON 收尾
+      const failStreamGracefully = (err) => {
+        if (streamFailed) return;
+        streamFailed = true;
+        if (clientClosed) {
+          cleanupStream();
+          return;
+        }
+        console.error(`${c.red}[ERR #${requestId}]${c.reset} 上游流异常: ${err.message}`);
+        if (headersCommitted && !res.writableEnded) {
+          res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'gateway_error', message: `claude-hud-gateway 上游流中断: ${err.message}` } })}\n\n`);
+          res.end();
+        } else if (!res.headersSent) {
+          const statusCode = err.code === 'GATEWAY_TTFB_TIMEOUT' ? 504 : 502;
+          res.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({
+            error: {
+              type: 'gateway_error',
+              message: `claude-hud-gateway 无法连接到目标上游 (${mergedConfig.targetBaseUrl}) 或上游中断: ${err.message}`,
+            },
+          }));
+        } else if (!res.writableEnded) {
+          res.destroy();
+        }
+        cleanupStream();
+      };
+
+      // P0-2: 流式请求 TTFB 保护 —— 上游迟迟不返回响应头时，先向客户端承诺 200 SSE 并启动心跳，
+      // 让 Claude Code 的 30s 看门狗在“响应头未落地”阶段也被心跳覆盖
+      if (isStreaming) {
+        graceTimer = setTimeout(() => {
+          graceTimer = null;
+          if (upstreamResponded || headersCommitted || clientClosed || res.writableEnded) return;
+          console.log(`${c.yellow}[TTFB #${requestId}]${c.reset} 上游 ${mergedConfig.ttfbGraceMs}ms 未返回响应头，提前承诺 200 SSE 并启用心跳保护`);
+          commitSseResponse(200);
+        }, mergedConfig.ttfbGraceMs);
+      }
 
       // 创建向上游的请求
       const upstreamReq = transport.request(
@@ -276,57 +392,28 @@ export function createProxyServer(customConfig = {}) {
           path: targetPath,
           method: req.method,
           headers: forwardHeaders,
+          timeout: mergedConfig.upstreamTimeoutMs,
         },
         (upstreamRes) => {
+          upstreamResponded = true;
+          if (graceTimer) {
+            clearTimeout(graceTimer);
+            graceTimer = null;
+          }
           const ttfbMs = Date.now() - startTime;
           const status = upstreamRes.statusCode;
           const isUpstreamSse = (upstreamRes.headers['content-type'] || '').includes('text/event-stream');
 
           // 【场景 A】：流式请求（stream=true 且上游返回成功 SSE）
           if (isStreaming && isUpstreamSse && status === 200) {
-            stats.activeStreams++;
-            console.log(`${c.blue}[REQ #${requestId}]${c.reset} ${req.method} ${req.url} -> SSE 流开启 (TTFB: ${ttfbMs}ms, 预估 Token: ${promptTokenEstimate})`);
+            if (!headersCommitted) {
+              console.log(`${c.blue}[REQ #${requestId}]${c.reset} ${req.method} ${req.url} -> SSE 流开启 (TTFB: ${ttfbMs}ms, 预估 Token: ${promptTokenEstimate})`);
+              commitSseResponse(status, upstreamRes.headers);
+            } else {
+              console.log(`${c.blue}[REQ #${requestId}]${c.reset} 上游响应头延迟到达 (TTFB: ${ttfbMs}ms)，继续透传 SSE 流`);
+            }
 
-            // 规范化响应头：强制注入禁用缓存与缓冲抑制
-            const responseHeaders = {
-              ...upstreamRes.headers,
-              'Content-Type': 'text/event-stream; charset=utf-8',
-              'Cache-Control': 'no-cache, no-transform',
-              'Connection': 'keep-alive',
-              'X-Accel-Buffering': 'no',
-            };
-            delete responseHeaders['content-length'];
-            delete responseHeaders['transfer-encoding'];
-
-            res.writeHead(status, responseHeaders);
-
-            let lastChunkTime = Date.now();
-            let sseBuffer = '';
-            let messageStartSeen = false;
             const decoder = new StringDecoder('utf-8');
-
-            const cleanupStream = () => {
-              if (streamClosed) return;
-              streamClosed = true;
-              clearInterval(heartbeatTimer);
-              stats.activeStreams = Math.max(0, stats.activeStreams - 1);
-            };
-
-            // 【功能 2：30s 看门狗保活心跳定时器】
-            const checkInterval = Math.min(1000, Math.max(200, Math.floor(mergedConfig.heartbeatIntervalMs / 2)));
-            const heartbeatTimer = setInterval(() => {
-              if (clientClosed || res.writableEnded) {
-                cleanupStream();
-                return;
-              }
-              const idleMs = Date.now() - lastChunkTime;
-              if (idleMs >= mergedConfig.heartbeatIntervalMs) {
-                res.write('event: ping\ndata: {"type":"ping"}\n\n');
-                lastChunkTime = Date.now();
-                stats.heartbeatsSentTotal++;
-                console.log(`${c.magenta}[HEARTBEAT #${requestId}]${c.reset} 模型长思考中，已下发保活心跳 event: ping (防 30s 崩溃)`);
-              }
-            }, checkInterval);
 
             upstreamRes.on('data', (chunk) => {
               lastChunkTime = Date.now();
@@ -341,13 +428,7 @@ export function createProxyServer(customConfig = {}) {
                 if (!eventBlock.trim()) continue;
 
                 // 检验与修补 SSE 事件
-                const transformedBlock = processSseEventBlock(
-                  eventBlock,
-                  promptTokenEstimate,
-                  requestId,
-                  () => { messageStartSeen = true; }
-                );
-
+                const transformedBlock = processSseEventBlock(eventBlock, promptTokenEstimate, requestId, patchState);
                 res.write(transformedBlock + '\n\n');
               }
             });
@@ -357,12 +438,7 @@ export function createProxyServer(customConfig = {}) {
               sseBuffer += decoder.end();
 
               if (sseBuffer.trim()) {
-                const finalBlock = processSseEventBlock(
-                  sseBuffer.trim(),
-                  promptTokenEstimate,
-                  requestId,
-                  () => { messageStartSeen = true; }
-                );
+                const finalBlock = processSseEventBlock(sseBuffer.trim(), promptTokenEstimate, requestId, patchState);
                 res.write(finalBlock + '\n\n');
               }
 
@@ -373,11 +449,13 @@ export function createProxyServer(customConfig = {}) {
               console.log(`${c.green}[DONE #${requestId}]${c.reset} 流传输完成 (总耗时: ${totalMs}ms)`);
             });
 
+            // P1-1: 上游流错误就地消化；部分运行时 FIN 提前断开不会触发 'error'，再以 close + complete 兜底
             upstreamRes.on('error', (err) => {
-              cleanupStream();
-              console.error(`${c.red}[ERR #${requestId}]${c.reset} 上游流中断: ${err.message}`);
-              if (!res.writableEnded) {
-                res.end();
+              failStreamGracefully(err);
+            });
+            upstreamRes.on('close', () => {
+              if (!upstreamRes.complete) {
+                failStreamGracefully(new Error('上游连接在 SSE 流完成前断开 (premature close)'));
               }
             });
 
@@ -387,9 +465,29 @@ export function createProxyServer(customConfig = {}) {
           // 【场景 B】：非流式请求 或 错误响应
           const chunks = [];
           upstreamRes.on('data', (c) => chunks.push(c));
+
+          // P1-1: 上游响应流错误（ECONNRESET 等）必须就地消化，杜绝进程级未捕获异常
+          upstreamRes.on('error', (err) => {
+            failStreamGracefully(err);
+          });
+          // P1-1 补充：FIN 提前断开时部分运行时不会触发 'error'，用 close + complete 兜底防挂死
+          upstreamRes.on('close', () => {
+            if (!upstreamRes.complete) {
+              failStreamGracefully(new Error('上游连接在响应完成前断开 (premature close)'));
+            }
+          });
+
           upstreamRes.on('end', () => {
             const resBuffer = Buffer.concat(chunks);
             let finalBuffer = resBuffer;
+
+            // 已提前承诺 SSE，但上游最终返回非 SSE 响应（错误页/JSON）：转为 SSE error 事件优雅收尾
+            if (headersCommitted) {
+              const ct = upstreamRes.headers['content-type'] || 'unknown';
+              const snippet = resBuffer.length > 0 ? resBuffer.toString('utf-8').slice(0, 300) : '';
+              failStreamGracefully(new Error(`提前承诺 SSE 后上游返回非流式响应 (HTTP ${status}, Content-Type: ${ct})${snippet ? `: ${snippet}` : ''}`));
+              return;
+            }
 
             // 若是非流式 /v1/messages，同样检查并修补 usage.input_tokens
             if (isMessagesEndpoint && status === 200 && upstreamRes.headers['content-type']?.includes('application/json')) {
@@ -413,6 +511,7 @@ export function createProxyServer(customConfig = {}) {
               res.writeHead(status, resHeaders);
             }
             res.end(finalBuffer);
+            cleanupStream();
 
             const totalMs = Date.now() - startTime;
             console.log(`${c.cyan}[RESP #${requestId}]${c.reset} ${req.method} ${req.url} -> ${status} (耗时: ${totalMs}ms)`);
@@ -420,19 +519,24 @@ export function createProxyServer(customConfig = {}) {
         }
       );
 
+      // TTFB 超时保护：仅在响应头未到达阶段生效；已进入响应阶段的静默思考由心跳覆盖，绝不掐断
+      upstreamReq.on('timeout', () => {
+        if (upstreamResponded) return;
+        const err = new Error(`上游 TTFB 超时 (${mergedConfig.upstreamTimeoutMs}ms 未返回响应头)`);
+        err.code = 'GATEWAY_TTFB_TIMEOUT';
+        upstreamReq.destroy(err);
+      });
+
       upstreamReq.on('error', (err) => {
         console.error(`${c.red}[ERROR #${requestId}]${c.reset} 转发到上游失败: ${err.message}`);
-        if (!res.headersSent) {
-          res.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8' });
-          res.end(JSON.stringify({
-            error: {
-              type: 'gateway_error',
-              message: `claude-hud-gateway 无法连接到目标上游 (${mergedConfig.targetBaseUrl}): ${err.message}`,
-            },
-          }));
-        } else {
-          res.destroy();
-        }
+        failStreamGracefully(err);
+      });
+
+      // P1-1: 客户端连接异常（断开后的残余写入等）就地消化，防止进程崩溃
+      res.on('error', (err) => {
+        clientClosed = true;
+        console.warn(`${c.yellow}[WARN #${requestId}]${c.reset} 客户端响应流异常: ${err.message}`);
+        cleanupStream();
       });
 
       // 客户端如果提前掐断连接（非正常完成），立刻销毁上游请求以节省 Token 与连接
@@ -441,6 +545,7 @@ export function createProxyServer(customConfig = {}) {
         if (!res.writableEnded && !upstreamReq.destroyed) {
           upstreamReq.destroy();
         }
+        cleanupStream();
       });
 
       // 写入请求体并发送
@@ -457,7 +562,9 @@ export function createProxyServer(customConfig = {}) {
 }
 
 // 【功能 1：首包 / 尾包 SSE 事件检查与 Token 注入器】
-function processSseEventBlock(rawBlock, estimatedTokens, requestId, onMessageStart) {
+// patchState: 记录本流首包是否被注入过估算 Token；尾包仅在首包被补过（估算口径一致）时才做
+// 双保注入，避免用启发式估算值污染合规上游在 message_start 里给出的真实 input_tokens (P0-1)
+function processSseEventBlock(rawBlock, estimatedTokens, requestId, patchState) {
   const lines = rawBlock.split(/\r?\n/);
   let eventName = '';
   let dataStr = '';
@@ -479,7 +586,6 @@ function processSseEventBlock(rawBlock, estimatedTokens, requestId, onMessageSta
 
   // 1. 拦截 message_start
   if (eventName === 'message_start' || parsedData?.type === 'message_start') {
-    onMessageStart?.();
     if (!parsedData.message) {
       parsedData.message = {
         id: parsedData.id || `msg_gen_${Date.now()}`,
@@ -497,6 +603,7 @@ function processSseEventBlock(rawBlock, estimatedTokens, requestId, onMessageSta
     if (typeof currentInput !== 'number' || currentInput <= 0) {
       msg.usage.input_tokens = estimatedTokens;
       stats.tokensPatchedTotal++;
+      if (patchState) patchState.startPatched = true;
       console.log(
         `${c.green}[PATCH #${requestId}]${c.reset} 上游首包缺失 input_tokens，已注入估算值: ${c.bold}${estimatedTokens}${c.reset} (进度条点亮！)`
       );
@@ -505,7 +612,12 @@ function processSseEventBlock(rawBlock, estimatedTokens, requestId, onMessageSta
   }
 
   // 2. 拦截 message_delta (双保救赎)
+  // 仅当首包也被补丁过才注入估算值；合规上游（首包带真实 input_tokens）的尾包必须原样透传，
+  // 否则会经 Claude Code “input_tokens != null 即覆写” 的补录通道污染真实 Token (P0-1)
   if (eventName === 'message_delta' || parsedData?.type === 'message_delta') {
+    if (!patchState?.startPatched) {
+      return rawBlock;
+    }
     parsedData.usage = parsedData.usage || {};
     const currentInput = parsedData.usage.input_tokens;
     if (typeof currentInput !== 'number' || currentInput <= 0) {
@@ -529,6 +641,7 @@ ${c.bold}======================================================${c.reset}
   * 目标上游 API : ${c.yellow}${config.targetBaseUrl}${c.reset}
   * 首包补丁功能 : ${config.autoEstimateTokens ? `${c.green}已启用 (自动注入 input_tokens)${c.reset}` : '未启用'}
   * 心跳保活周期 : ${c.magenta}每 ${config.heartbeatIntervalMs}ms 下发 event: ping (防 30s 崩溃)${c.reset}
+  * TTFB 保护   : ${c.magenta}上游 ${config.ttfbGraceMs}ms 未回响应头则提前承诺 SSE 并启用心跳${c.reset}
   * 健康检查端点 : ${c.cyan}http://${config.host}:${config.port}/health${c.reset}
 
 ${c.bold}在 Claude Code 中一键使用本网关:${c.reset}

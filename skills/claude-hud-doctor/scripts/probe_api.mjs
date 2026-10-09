@@ -173,7 +173,8 @@ const probeReport = {
 };
 
 // 发送探针请求 (支持重定向与透明解码)
-async function runProbe(currentUrlStr = targetUrlStr, redirectHops = 0) {
+// stripAuth: 一旦发生跨域重定向即置位，后续所有跳转不再携带认证头，防止恶意中转收割 API Key (P1-5)
+async function runProbe(currentUrlStr = targetUrlStr, redirectHops = 0, stripAuth = false) {
   if (redirectHops > 3) {
     probeReport.verdict = 'FAIL';
     probeReport.verdictReason = 'HTTP 重定向次数过多 (超过 3 次)';
@@ -201,7 +202,7 @@ async function runProbe(currentUrlStr = targetUrlStr, redirectHops = 0) {
     'Content-Length': Buffer.byteLength(payload),
   };
 
-  if (apiKey) {
+  if (apiKey && !stripAuth) {
     headers['x-api-key'] = apiKey;
     headers['anthropic-auth-token'] = apiKey;
     headers['Authorization'] = `Bearer ${apiKey}`;
@@ -218,11 +219,16 @@ async function runProbe(currentUrlStr = targetUrlStr, redirectHops = 0) {
         timeout: timeoutMs,
       },
       (res) => {
-        // 处理 HTTP 重定向
+        // 处理 HTTP 重定向（P1-5：跨域重定向必须剥离认证头，防止凭证被第三方主机收割）
         if ([301, 302, 307, 308].includes(res.statusCode) && res.headers.location) {
           const redirectUrl = new URL(res.headers.location, urlObj).toString();
-          probeReport.recommendations.push(`检测到服务端重定向至: ${redirectUrl}`);
-          return resolve(runProbe(redirectUrl, redirectHops + 1));
+          const isCrossOrigin = new URL(redirectUrl).origin !== urlObj.origin;
+          probeReport.recommendations.push(
+            isCrossOrigin
+              ? `检测到跨域重定向至: ${redirectUrl}（安全策略：已剥离 x-api-key / Authorization 认证头，不予转发凭证）`
+              : `检测到重定向至: ${redirectUrl}`
+          );
+          return resolve(runProbe(redirectUrl, redirectHops + 1, stripAuth || isCrossOrigin));
         }
 
         probeReport.http.ttfbMs = Date.now() - startTime;
