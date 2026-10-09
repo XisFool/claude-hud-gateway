@@ -34,7 +34,7 @@ claude-hud-gateway/
 │   ├── reverse_analysis.md        # Claude Code 2.1.295 与 HUD 底层逆向终审报告
 │   └── sse_specification.md       # Anthropic Messages API SSE 流式协议标准规范
 ├── test/                          # 自动化集成测试套件
-│   └── run_tests.mjs              # 30 项全场景自动化回归测试（Mock 服务 + SQLite 沙箱）
+│   └── run_tests.mjs              # 36 项全场景自动化回归测试（Mock 服务 + SQLite 沙箱）
 ├── README.md                      # 项目中英文文档
 ├── LICENSE                        # MIT 开源协议
 └── package.json                   # 根工作区脚本编排
@@ -59,6 +59,14 @@ claude-hud-gateway/
 ### 3.4 探针安全防护 (P1-5 核心)
 - `probe_api.mjs` 遇到 301/302/307/308 重定向时，若目标 `origin` 与原地址不同，**必须强制剥离 `Authorization`、`x-api-key` 与 `anthropic-auth-token`**，严防恶意中转钓鱼窃取凭证。
 
+### 3.5 探针全局总超时熔断 (P2 核心)
+- `--timeout`（`timeoutMs`）语义为**全局总超时**：模块级 `probeDeadlineAt` 绝对截止时间必须覆盖 TTFB、全部重定向跳转与整个流式接收生命周期。
+- 严禁仅依赖 socket 空闲超时——慢速滴包（间隔小于空闲阈值）可无限绕过；每跳必须挂载硬性计时器到期熔断（错误码 `PROBE_DEADLINE`），所有终态路径清空计时器，重定向前 `res.resume()` 排空响应体，`res` close 不完整时兜底收尾。
+
+### 3.6 doctor CLI 降级链路安全 (P2 核心)
+- `doctor.mjs` 的 sqlite3 CLI 链路：读取必须优先 `-json` 精确模式（多行 JSON 不再被管道分隔解析误判损坏），写入必须走 `execFileSync` 免 Shell + SQL stdin 通道，严禁将配置内容拼入 shell 命令串（会被双引号剥离 / `$` 展开破坏）。
+- 反斜杠检测必须使用逐字符配对扫描（`hasUnescapedBackslash`），严禁 `includes('\\') && !includes('\\\\')` 式启发式（会漏判"既有转义对又有孤立反斜杠"的混合命令）。
+
 ---
 
 ## 4. 编码规范与工作约定 (Agent Working Agreement)
@@ -79,5 +87,5 @@ claude-hud-gateway/
   npm test
   # 即 node --no-warnings test/run_tests.mjs
   ```
-  **必须确保 30/30 项测试全部通过**，严禁引入回归缺陷。
+  **必须确保 36/36 项测试全部通过**，严禁引入回归缺陷。
 - Git Commit Message 必须使用中文规范（如 `fix: 修复...`、`feat: 新增...`）。

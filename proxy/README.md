@@ -106,7 +106,8 @@ pm2 startup
 
 ### Windows 后台启动 (PowerShell)
 ```powershell
-Start-Process node -ArgumentList "D:\code_sum\Claude_Code\claude-hud-gateway\proxy\proxy.mjs" -WindowStyle Hidden
+# 在项目根目录执行（$PWD 即仓库克隆位置，无需手工改绝对路径）
+Start-Process node -ArgumentList "$PWD\proxy\proxy.mjs" -WindowStyle Hidden
 ```
 
 ### Linux (Systemd 单元示例)

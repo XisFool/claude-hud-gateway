@@ -8,6 +8,5 @@
   "autoEstimateTokens": true,
   "tokenEstimateRatio": 2.5,
   "upstreamTimeoutMs": 60000,
-  "ttfbGraceMs": 10000,
-  "logLevel": "info"
+  "ttfbGraceMs": 10000
 }
