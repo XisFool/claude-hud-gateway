@@ -50,6 +50,12 @@ const stats = {
   heartbeatsSentTotal: 0,
 };
 
+// 心跳周期护栏：非法值（NaN/负数/过小）回退默认 8000ms，防止高频空转与心跳轰炸
+export function sanitizeHeartbeatIntervalMs(value, fallback = 8000) {
+  const parsed = typeof value === 'number' ? value : Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed >= 200 ? parsed : fallback;
+}
+
 // 1. 读取配置文件或环境变量
 function loadConfig() {
   const configFiles = [
@@ -89,7 +95,7 @@ function loadConfig() {
   const host = process.env.HOST || fileConfig.host || '127.0.0.1';
   const targetBaseUrl = process.env.TARGET_BASE_URL || fileConfig.targetBaseUrl || fallbackTargetUrl || 'https://api.anthropic.com';
   const targetApiKey = process.env.TARGET_API_KEY || fileConfig.targetApiKey || '';
-  const heartbeatIntervalMs = Number.parseInt(process.env.HEARTBEAT_INTERVAL_MS || fileConfig.heartbeatIntervalMs || '8000', 10);
+  const heartbeatIntervalMs = sanitizeHeartbeatIntervalMs(process.env.HEARTBEAT_INTERVAL_MS || fileConfig.heartbeatIntervalMs || '8000');
   const autoEstimateTokens = process.env.AUTO_ESTIMATE_TOKENS !== 'false' && (fileConfig.autoEstimateTokens !== false);
   const tokenEstimateRatio = Number.parseFloat(process.env.TOKEN_ESTIMATE_RATIO || fileConfig.tokenEstimateRatio || '2.5');
   const upstreamTimeoutMs = Number.parseInt(process.env.UPSTREAM_TIMEOUT_MS || fileConfig.upstreamTimeoutMs || '60000', 10);
@@ -114,6 +120,8 @@ const config = loadConfig();
 export function estimateTokens(payload, ratio = 2.5) {
   if (!payload) return 50;
   let text = '';
+  // 多模态附件（图片/文档）无法按字符折算，按 Anthropic 官方经验值每附件计 1600 Token
+  let extraTokens = 0;
 
   // 统计 system prompt
   if (typeof payload.system === 'string') {
@@ -141,12 +149,15 @@ export function estimateTokens(payload, ratio = 2.5) {
               for (const sub of block.content) {
                 if (sub?.text) text += sub.text;
                 else if (typeof sub === 'string') text += sub;
+                else if (sub?.type === 'image' || sub?.type === 'document') extraTokens += 1600;
               }
             } else if (block.content) {
               text += JSON.stringify(block.content);
             }
           } else if (block?.type === 'tool_use') {
             text += JSON.stringify(block.input || {});
+          } else if (block?.type === 'image' || block?.type === 'document') {
+            extraTokens += 1600;
           }
         }
       }
@@ -174,15 +185,21 @@ export function estimateTokens(payload, ratio = 2.5) {
   // 经验分词系数：依据 ratio 参数做自适应调整
   const charDivisor = Math.max(1, ratio);
   const estimated = Math.ceil((cjkCount * 1.5) + (otherCount / charDivisor));
-  return Math.max(12, estimated);
+  return Math.max(12, estimated + extraTokens);
 }
 
-// 目标路径智能规范化（规避 /v1 拼接导致的 /v1/v1/messages 404 故障）
+// 目标路径智能规范化（兼容裸主机、/v1 后缀与完整 /v1/messages 端点，规避 /v1/v1/messages 404 故障）
 export function resolveTargetPath(targetUrlObj, reqUrl) {
   const basePath = targetUrlObj.pathname.replace(/\/+$/, '');
   let reqPath = reqUrl;
-  if (basePath.endsWith('/v1') && (reqPath === '/v1' || reqPath.startsWith('/v1/'))) {
-    reqPath = reqPath.slice(3);
+  // 按最长后缀优先匹配，带边界校验（后随 /、? 或结尾），防止误剥前缀
+  for (const suffix of ['/v1/messages', '/v1']) {
+    if (basePath === suffix || basePath.endsWith(suffix)) {
+      if (reqPath === suffix || reqPath.startsWith(`${suffix}/`) || reqPath.startsWith(`${suffix}?`)) {
+        reqPath = reqPath.slice(suffix.length);
+      }
+      break;
+    }
   }
   return (basePath + reqPath) || '/';
 }
@@ -202,7 +219,13 @@ export function findSseBoundary(buffer) {
 
 // 3. 构建 HTTP 代理服务器
 export function createProxyServer(customConfig = {}) {
-  const mergedConfig = { ...config, ...customConfig };
+  const mergedConfig = {
+    ...config,
+    ...customConfig,
+    heartbeatIntervalMs: sanitizeHeartbeatIntervalMs(
+      customConfig.heartbeatIntervalMs ?? config.heartbeatIntervalMs
+    ),
+  };
   const targetUrlObj = new URL(mergedConfig.targetBaseUrl);
   const isHttps = targetUrlObj.protocol === 'https:';
   const transport = isHttps ? https : http;

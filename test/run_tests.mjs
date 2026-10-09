@@ -40,6 +40,7 @@ import {
   createProxyServer,
   estimateTokens,
   resolveTargetPath,
+  sanitizeHeartbeatIntervalMs,
   findSseBoundary,
 } from '../proxy/proxy.mjs';
 
@@ -156,6 +157,60 @@ it('estimateTokens: 支持自定义 ratio 比例参数调整', () => {
   assert(valDefault > valLoose, '宽松分词比率计算出的 Token 数应当更小');
 });
 
+it('estimateTokens: 图片/文档附件按 1600 Token 经验值计入（含 tool_result 内嵌附件）', () => {
+  // 基线文本取 100 字符（约 40 Token），确保高于 12 Token 下限，使增量断言精确成立
+  const baseText = 'a'.repeat(100);
+  const textOnly = estimateTokens({
+    messages: [{ role: 'user', content: [{ type: 'text', text: baseText }] }],
+  });
+  const withImage = estimateTokens({
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'text', text: baseText },
+        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'aGVsbG8=' } },
+      ],
+    }],
+  });
+  assert(withImage - textOnly >= 1600, `顶层图片附件应至少折算 1600 Token（实际增量 ${withImage - textOnly}）`);
+
+  const withDoc = estimateTokens({
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'text', text: baseText },
+        { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: 'aGVsbG8=' } },
+      ],
+    }],
+  });
+  assert(withDoc - textOnly >= 1600, `顶层文档附件应至少折算 1600 Token（实际增量 ${withDoc - textOnly}）`);
+
+  const toolResultBaseline = estimateTokens({
+    messages: [{
+      role: 'user',
+      content: [{
+        type: 'tool_result',
+        tool_use_id: 't1',
+        content: [{ type: 'text', text: baseText }],
+      }],
+    }],
+  });
+  const toolResultWithImage = estimateTokens({
+    messages: [{
+      role: 'user',
+      content: [{
+        type: 'tool_result',
+        tool_use_id: 't1',
+        content: [
+          { type: 'text', text: baseText },
+          { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'aGVsbG8=' } },
+        ],
+      }],
+    }],
+  });
+  assert(toolResultWithImage - toolResultBaseline >= 1600, `tool_result 内嵌图片同样必须计入估算（实际增量 ${toolResultWithImage - toolResultBaseline}）`);
+});
+
 it('resolveTargetPath: 智能处理 /v1 避免双重拼接 /v1/v1/messages', () => {
   assert.strictEqual(
     resolveTargetPath(new URL('https://api.anthropic.com'), '/v1/messages'),
@@ -173,6 +228,37 @@ it('resolveTargetPath: 智能处理 /v1 避免双重拼接 /v1/v1/messages', () 
     resolveTargetPath(new URL('https://api.relay.com/api'), '/v1/messages'),
     '/api/v1/messages'
   );
+});
+
+it('resolveTargetPath: 兼容完整 /v1/messages 端点配置（含查询参数边界，杜绝 /v1/messages/v1/messages）', () => {
+  assert.strictEqual(
+    resolveTargetPath(new URL('https://api.relay.com/v1/messages'), '/v1/messages'),
+    '/v1/messages'
+  );
+  assert.strictEqual(
+    resolveTargetPath(new URL('https://api.relay.com/v1/messages'), '/v1/messages?beta=true'),
+    '/v1/messages?beta=true'
+  );
+  assert.strictEqual(
+    resolveTargetPath(new URL('https://api.relay.com/api/v1/messages'), '/v1/messages'),
+    '/api/v1/messages'
+  );
+  // 边界防护：/v1messages 这类形似前缀不得被误剥
+  assert.strictEqual(
+    resolveTargetPath(new URL('https://api.relay.com/v1'), '/v1messages'),
+    '/v1/v1messages'
+  );
+});
+
+it('sanitizeHeartbeatIntervalMs: 非法心跳周期回退 8000ms，合法值原样保留', () => {
+  assert.strictEqual(sanitizeHeartbeatIntervalMs(-500), 8000);
+  assert.strictEqual(sanitizeHeartbeatIntervalMs(0), 8000);
+  assert.strictEqual(sanitizeHeartbeatIntervalMs('abc'), 8000);
+  assert.strictEqual(sanitizeHeartbeatIntervalMs(undefined), 8000);
+  assert.strictEqual(sanitizeHeartbeatIntervalMs(50), 8000);
+  assert.strictEqual(sanitizeHeartbeatIntervalMs(300), 300);
+  assert.strictEqual(sanitizeHeartbeatIntervalMs('500'), 500);
+  assert.strictEqual(sanitizeHeartbeatIntervalMs(8000), 8000);
 });
 
 it('findSseBoundary: 能够精确识别 LF (\\n\\n) 与 CRLF (\\r\\n\\r\\n) 两种标准分隔符', () => {
