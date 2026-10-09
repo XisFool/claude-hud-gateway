@@ -1,0 +1,11 @@
+{
+  "_comment": "claude-hud-gateway Sidecar 本地网关配置文件",
+  "port": 8080,
+  "host": "127.0.0.1",
+  "targetBaseUrl": "https://api.openai-proxy.com",
+  "targetApiKey": "",
+  "heartbeatIntervalMs": 8000,
+  "autoEstimateTokens": true,
+  "tokenEstimateRatio": 2.5,
+  "logLevel": "info"
+}

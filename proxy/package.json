@@ -1,0 +1,24 @@
+{
+  "name": "claude-hud-proxy",
+  "version": "1.0.0",
+  "description": "Claude Code 终端状态栏 (Claude HUD) 本地极简 Sidecar 透明流式增强网关",
+  "type": "module",
+  "main": "proxy.mjs",
+  "scripts": {
+    "start": "node proxy.mjs",
+    "dev": "node --watch proxy.mjs"
+  },
+  "keywords": [
+    "claude-hud",
+    "claude-code",
+    "proxy",
+    "sse",
+    "streaming",
+    "gateway"
+  ],
+  "author": "claude-hud-gateway contributors",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

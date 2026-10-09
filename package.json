@@ -1,0 +1,35 @@
+{
+  "name": "claude-hud-gateway",
+  "version": "1.0.0",
+  "description": "Claude Code 终端状态栏 (Claude HUD) 激活诊断、自愈与流式协议增强网关",
+  "type": "module",
+  "main": "proxy/proxy.mjs",
+  "bin": {
+    "claude-hud-doctor": "./skills/claude-hud-doctor/scripts/doctor.mjs",
+    "claude-hud-probe": "./skills/claude-hud-doctor/scripts/probe_api.mjs",
+    "claude-hud-proxy": "./proxy/proxy.mjs"
+  },
+  "scripts": {
+    "doctor": "node skills/claude-hud-doctor/scripts/doctor.mjs",
+    "doctor:fix": "node skills/claude-hud-doctor/scripts/doctor.mjs --fix",
+    "probe": "node skills/claude-hud-doctor/scripts/probe_api.mjs",
+    "proxy": "node proxy/proxy.mjs",
+    "test": "node test/run_tests.mjs"
+  },
+  "keywords": [
+    "claude-code",
+    "claude-hud",
+    "statusline",
+    "streaming",
+    "sse",
+    "proxy",
+    "gateway",
+    "doctor",
+    "cc-switch"
+  ],
+  "author": "claude-hud-gateway contributors",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
